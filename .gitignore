@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Training outputs
+outputs/
+lightning_logs/
+*.ckpt
+
+# OS / editor
+.DS_Store
+.vscode/

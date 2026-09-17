@@ -1,0 +1,5 @@
+[virtualenvs]
+create = true
+
+[virtualenvs.options]
+system-site-packages = true

@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "gnn-sar"
+version = "0.1.0"
+description = "Spatio-temporal GNN per il monitoraggio sub-annuale del consumo di suolo da serie Sentinel-1 SAR"
+authors = ["Matteo Campana <matteo.campana996@gmail.com>"]
+readme = "README.md"
+packages = [{ include = "gnn_sar", from = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+torch = "2.6.0"
+pytorch-lightning = "2.5.0"
+torch-geometric = "^2.8"
+torchmetrics = "^1.4"
+numpy = "^2.0"
+scipy = "^1.13"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+scikit-learn = "^1.5"
+networkx = "^3.3"
+matplotlib = "^3.9"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
