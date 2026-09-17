@@ -232,3 +232,19 @@ def test_the_demo_runs_every_requested_model_end_to_end(tmp_path):
     for metrics in results.values():
         assert "test/annual_f1" in metrics
         assert "truth/delay_detection_rate" in metrics
+
+
+def test_demo_results_do_not_depend_on_the_order_of_the_models():
+    """Each model must be seeded independently, or --models reorders the scores."""
+    def run(models: list[str]) -> dict[str, float]:
+        args = build_parser().parse_args(
+            ["demo", "--models", *models, "--max-epochs", "2",
+             "--nodes-per-side", "8", "--n-time", "8", "--periods-per-year", "4"]
+        )
+        return {name: metrics["test/total"] for name, metrics in run_demo(args).items()}
+
+    forward = run(["stgnn", "mlp"])
+    reversed_order = run(["mlp", "stgnn"])
+
+    assert forward["mlp"] == pytest.approx(reversed_order["mlp"], rel=1e-6)
+    assert forward["stgnn"] == pytest.approx(reversed_order["stgnn"], rel=1e-6)

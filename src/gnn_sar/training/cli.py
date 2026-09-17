@@ -111,6 +111,10 @@ def run_demo(args: argparse.Namespace) -> dict[str, dict[str, float]]:
 
     results: dict[str, dict[str, float]] = {}
     for name in args.models:
+        # Re-seed before each model, not once for the whole loop: otherwise the
+        # second model inherits the RNG state the first one left behind and its
+        # score depends on the order --models was given in.
+        pl.seed_everything(args.seed, workers=True)
         datamodule = SpatioTemporalGraphDataModule(
             graph,
             graph_config=config.graph,
