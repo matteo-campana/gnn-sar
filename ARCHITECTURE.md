@@ -65,6 +65,42 @@ type, from two families:
 Adjacency wins any edge both families would produce, so the types stay a
 partition of the edge set — a test asserts this.
 
+### 2b. Node features are assembled from blocks
+
+`features` is a `(T, N, D)` tensor built by `concatenate_features` from as many
+blocks as a study area has, each contributing named channels:
+
+| Block | Function | Channels |
+| --- | --- | --- |
+| Multitemporal radar statistics | `aggregate_stack` | per band × per statistic |
+| Texture | `glcm_texture_stack` | per band × per GLCM property |
+| Shape | `geometric_attributes` | log-area, compactness, elongation |
+| Proximity | `proximity_attributes` | one per reference layer |
+
+The GLCM is computed **per segment**, not in a sliding window, and counts only
+pixel pairs whose two members belong to the same node. A window straddling a
+border would measure the contrast between two units; that is an edge property,
+and letting it leak into a node feature would double-count the very structure
+the graph exists to represent. The quantisation range is taken once over the
+whole series (`glcm_texture_stack` does this for you), because a texture
+quantised against each date's own extremes cannot be compared across dates —
+and comparing across dates is the entire job.
+
+Static attributes are broadcast over time by `broadcast_static`. Two omissions
+are deliberate:
+
+- **No raw coordinates.** They let a model memorise where the positives are,
+  and since the split is a geographic cut (§7 below), train and test occupy
+  disjoint coordinate ranges — so a coordinate channel is a leak *and* a
+  guaranteed distribution shift. Shape descriptors are translation invariant;
+  proximity is a distance to a layer, not a position.
+- **No absolute size in pixels**, only `log1p(area)`, because parcel areas span
+  several orders of magnitude and the raw value would dominate standardisation.
+
+`SpatioTemporalGraph.feature_names` carries one name per channel and is
+validated against `D`. It is what makes a 12-channel tensor answerable when
+someone asks which feature the model actually used.
+
 ### 3. Time is a causal block matrix
 
 `temporal_edges(N, T, order)` emits `(t-k, i) → (t, i)` for `k` in `1..order`,

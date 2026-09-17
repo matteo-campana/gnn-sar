@@ -26,9 +26,16 @@ from dataclasses import dataclass
 import numpy as np
 
 from gnn_sar.config import GraphConfig
+from gnn_sar.data.attributes import (
+    broadcast_static,
+    concatenate_features,
+    geometric_attributes,
+    proximity_attributes,
+)
 from gnn_sar.data.features import to_decibel
 from gnn_sar.data.graph import SpatioTemporalGraph, build_spatial_edges
 from gnn_sar.data.segmentation import NodeGeometries, aggregate_stack
+from gnn_sar.data.texture import glcm_texture_stack
 
 __all__ = ["SyntheticLandTakeScenario", "make_synthetic_scenario"]
 
@@ -87,6 +94,7 @@ class SyntheticLandTakeScenario:
             annual_labels=self.graph.annual_labels,
             year_index=self.graph.year_index,
             geometries=self.geometries,
+            feature_names=self.graph.feature_names,
         )
 
 
@@ -104,6 +112,8 @@ def make_synthetic_scenario(
     looks: int = 4,
     contrast: float = 1.0,
     heterogeneity_db: float = 1.2,
+    include_texture: bool = False,
+    include_attributes: bool = False,
     graph_config: GraphConfig | None = None,
     seed: int | None = 0,
 ) -> SyntheticLandTakeScenario:
@@ -129,6 +139,15 @@ def make_synthetic_scenario(
         heterogeneity_db: standard deviation of the per-node, time-constant
             offset standing in for land-cover variety. It cannot be mistaken
             for a change signal, but it does hide one.
+        include_texture: append per-segment GLCM contrast and homogeneity of
+            the VV band. Off by default because it costs a pass over the
+            raster per composite.
+        include_attributes: append the static geometric and proximity
+            attributes of §5.2. Off by default, and note that on this
+            generator's *regular tiling* every unit has the same shape, so the
+            geometric channels are constant and carry nothing — they exist here
+            to exercise the code path, and only become informative on cadastral
+            or SLIC geometries.
         graph_config: edge-construction settings.
         seed: RNG seed, ``None`` for non-reproducible output.
 
@@ -176,6 +195,24 @@ def make_synthetic_scenario(
         rng=rng,
     )
     features = aggregate_stack(stack, geometries, statistics=("mean", "std"))
+    names = [
+        f"{band}_{statistic}"
+        for band in ("vv", "vh", "coherence")
+        for statistic in ("mean", "std")
+    ]
+    blocks = [features]
+    if include_texture:
+        blocks.append(glcm_texture_stack(stack, geometries, bands=(0,)))
+        names += ["vv_glcm_contrast", "vv_glcm_homogeneity"]
+    if include_attributes:
+        proximity, proximity_names = proximity_attributes(
+            geometries, {"corridor": corridor}
+        )
+        static = np.concatenate([geometric_attributes(geometries), proximity], axis=1)
+        blocks.append(broadcast_static(static, n_time))
+        names += ["log_area", "compactness", "elongation"]
+        names += [f"proximity_{name}" for name in proximity_names]
+    features = concatenate_features(*blocks) if len(blocks) > 1 else features
 
     year_index = np.arange(n_time) // periods_per_year
     n_years = int(year_index.max()) + 1
@@ -190,6 +227,7 @@ def make_synthetic_scenario(
         annual_labels=annual_labels,
         year_index=year_index,
         geometries=geometries,
+        feature_names=tuple(names),
     )
     return SyntheticLandTakeScenario(
         graph=graph,

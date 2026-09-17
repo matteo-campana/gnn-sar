@@ -181,3 +181,28 @@ def test_splits_are_disjoint_exhaustive_and_geographic():
 def test_split_fractions_must_sum_to_one():
     with pytest.raises(ValueError, match="summing to 1"):
         _graph().split_nodes((0.5, 0.2, 0.2))
+
+
+def test_feature_names_must_match_the_channel_count():
+    with pytest.raises(ValueError, match="feature_names must have 3 entries"):
+        SpatioTemporalGraph(
+            features=np.zeros((2, 4, 3)),
+            spatial_edge_index=np.zeros((2, 0), dtype=np.int64),
+            spatial_edge_type=np.zeros(0, dtype=np.int64),
+            feature_names=("a", "b"),
+        )
+
+
+def test_a_window_keeps_the_feature_names():
+    graph = _graph(n_time=6)
+    named = SpatioTemporalGraph(
+        features=graph.features,
+        spatial_edge_index=graph.spatial_edge_index,
+        spatial_edge_type=graph.spatial_edge_type,
+        annual_labels=graph.annual_labels,
+        year_index=graph.year_index,
+        geometries=graph.geometries,
+        feature_names=("a", "b", "c"),
+    )
+
+    assert named.window(1, 2).feature_names == ("a", "b", "c")

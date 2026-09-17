@@ -71,6 +71,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="train on exact sub-annual labels instead of the weak annual ones; "
         "the difference is the price of weak supervision",
     )
+    demo.add_argument(
+        "--features",
+        nargs="*",
+        default=["radar"],
+        choices=["radar", "texture", "attributes"],
+        help="which node-feature blocks to assemble (§5.2). 'radar' is the "
+        "multitemporal VV/VH/coherence statistics, 'texture' adds per-segment "
+        "GLCM, 'attributes' adds shape and proximity to the corridor",
+    )
     demo.add_argument("--seed", type=int, default=0)
     demo.add_argument("--output", type=Path, help="write the results as JSON")
     return parser
@@ -93,6 +102,8 @@ def run_demo(args: argparse.Namespace) -> dict[str, dict[str, float]]:
         n_time=args.n_time,
         periods_per_year=args.periods_per_year,
         contrast=args.contrast,
+        include_texture="texture" in args.features,
+        include_attributes="attributes" in args.features,
         graph_config=config.graph,
         seed=args.seed,
     )

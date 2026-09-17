@@ -107,3 +107,72 @@ def test_the_stack_has_one_frame_per_composite(scenario):
 def test_invalid_settings_are_rejected(kwargs, message):
     with pytest.raises(ValueError, match=message):
         make_synthetic_scenario(height=16, width=16, n_time=4, **kwargs)
+
+
+def test_the_default_feature_block_is_the_radar_statistics(scenario):
+    assert scenario.graph.n_features == 6
+    assert scenario.graph.feature_names == (
+        "vv_mean",
+        "vv_std",
+        "vh_mean",
+        "vh_std",
+        "coherence_mean",
+        "coherence_std",
+    )
+
+
+def test_texture_and_attributes_extend_the_feature_tensor():
+    scenario = make_synthetic_scenario(
+        height=32,
+        width=32,
+        n_time=6,
+        periods_per_year=3,
+        include_texture=True,
+        include_attributes=True,
+        seed=0,
+    )
+    graph = scenario.graph
+
+    assert graph.n_features == len(graph.feature_names) == 12
+    assert graph.feature_names[6:8] == ("vv_glcm_contrast", "vv_glcm_homogeneity")
+    assert graph.feature_names[8:] == (
+        "log_area",
+        "compactness",
+        "elongation",
+        "proximity_corridor",
+    )
+
+
+def test_the_corridor_proximity_channel_peaks_on_the_corridor():
+    scenario = make_synthetic_scenario(
+        height=48, width=48, n_time=6, periods_per_year=3, include_attributes=True, seed=0
+    )
+    channel = scenario.graph.feature_names.index("proximity_corridor")
+    values = scenario.graph.features[0, :, channel]
+
+    assert np.allclose(values[scenario.corridor], 1.0)
+    assert values[~scenario.corridor].max() < 1.0
+
+
+def test_extra_feature_blocks_leave_the_process_unchanged():
+    """Only the representation changes; the land-take history must not."""
+    plain = make_synthetic_scenario(height=32, width=32, n_time=6, seed=7)
+    rich = make_synthetic_scenario(
+        height=32,
+        width=32,
+        n_time=6,
+        include_texture=True,
+        include_attributes=True,
+        seed=7,
+    )
+
+    assert np.array_equal(plain.onset, rich.onset)
+    assert np.allclose(plain.graph.features, rich.graph.features[..., :6])
+
+
+def test_exact_labels_keep_the_feature_names():
+    scenario = make_synthetic_scenario(
+        height=32, width=32, n_time=6, include_texture=True, seed=0
+    )
+
+    assert scenario.with_exact_labels().feature_names == scenario.graph.feature_names

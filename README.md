@@ -38,6 +38,9 @@ the comparison:
 
 ```bash
 gnn-sar demo --models stgnn temporal mlp rf --max-epochs 120
+
+# the same run with the full §5.2 feature set instead of radar statistics alone
+gnn-sar demo --models stgnn temporal --features radar texture attributes
 ```
 
 Or drive the pieces yourself:
@@ -49,7 +52,11 @@ from gnn_sar.config import ModelConfig
 from gnn_sar.training import SpatioTemporalGraphDataModule, SoilSealingModule
 import pytorch_lightning as pl
 
-scenario = make_synthetic_scenario(height=80, width=80, n_time=24)
+scenario = make_synthetic_scenario(
+    height=80, width=80, n_time=24,
+    include_texture=True, include_attributes=True,   # optional §5.2 blocks
+)
+scenario.graph.feature_names            # what each channel is
 data = SpatioTemporalGraphDataModule(scenario.graph)
 data.setup()
 
@@ -75,7 +82,17 @@ is segmented **once** — on a multitemporal composite, or from cadastral parcel
 **Two edge families.** `adjacency` links segments that share a border;
 `connectivity` links nearby centroids along an infrastructure corridor. Together
 they encode the project's hypothesis: land take propagates along roads and
-thickens at the urban fringe, rather than appearing uniformly at random.
+thickens at the urban fringe, rather than appearing uniformly at random. The
+same hypothesis also reaches the **features**, through
+`proximity_attributes` — so a unit can read "I am near a road" as a property of
+itself, not only through the messages it receives.
+
+**Node features come in blocks.** Multitemporal VV/VH/coherence statistics
+(`aggregate_stack`), per-segment GLCM texture (`glcm_texture_stack`), and
+time-invariant shape and proximity attributes (`geometric_attributes`,
+`proximity_attributes`), joined by `concatenate_features` and named on the
+graph. Raw coordinates are deliberately **not** among them: they would leak the
+geographic split.
 
 **Time is causal.** The spatio-temporal super-graph is block lower-triangular:
 `(t-k, i) → (t, i)` and never the reverse. A sub-annual product has to be
@@ -103,6 +120,8 @@ composites of the same labelled year does not change the loss at all.
 | `gnn_sar.config` | Dataclass configs, JSON-serialisable, validated at construction |
 | `gnn_sar.data.segmentation` | Fixed node geometries: cadastral, regular tiling, or SLIC |
 | `gnn_sar.data.features` | Irregular revisit → regular composites; dB; leakage-safe standardisation |
+| `gnn_sar.data.texture` | Per-segment GLCM contrast, homogeneity and energy |
+| `gnn_sar.data.attributes` | Static node attributes: shape, and proximity to a reference layer |
 | `gnn_sar.data.graph` | Adjacency and connectivity edges, causal super-graph, geographic splits |
 | `gnn_sar.data.targets` | Weak (annual) and strong (dated) supervision targets |
 | `gnn_sar.data.synthetic` | A land-take scenario with topological propagation and weak labels |
@@ -138,12 +157,63 @@ answer it returns on synthetic data is "not yet". Treat the number as a check
 that the harness works and reports against itself, not as evidence either way
 about the relational hypothesis, which only real Sentinel-1 data can settle.
 
+Adding the optional §5.2 blocks (`--features radar texture attributes`) moves
+the same single run to F1 0.95 for `temporal` and 0.77 for `stgnn`: texture and
+proximity help the model that reads each unit on its own, and do not rescue the
+graph. One seed, so treat the direction as a hint, not a measurement.
+
 Reproduce with:
 
 ```bash
 gnn-sar demo --models stgnn temporal mlp rf --max-epochs 120 \
     --nodes-per-side 20 --n-time 24 --contrast 0.3
 ```
+
+## Coverage against the proposal
+
+Every element of the proposal's Figure 2 and §5.1–5.5, and where it stands.
+
+| Proposal element | § | Status | Where |
+| --- | --- | --- | --- |
+| Stable node geometries, fixed over the series | 5.2 | done | `NodeGeometries` |
+| SLIC super-pixels | 5.2 | done | `slic_geometries` (extra `segmentation`) |
+| Cadastral parcels as nodes | 5.2 | done | `NodeGeometries.from_label_image` |
+| Temporal compositing, 6–12 d revisit → monthly | Fig. 2 ② | done | `composite_by_period` |
+| Node feature tensor `T × N × D` | Fig. 2 ③ | done | `aggregate_stack` |
+| Multitemporal VV/VH statistics | 5.2 | done | `aggregate_stack` |
+| GLCM texture | 5.2 | done | `glcm_texture_stack` |
+| Geometric attributes | 5.2 | done | `geometric_attributes` |
+| Proximity to roads / built-up | 5.2 | done | `proximity_attributes` |
+| InSAR coherence as a feature | 5.1 | consumed, not computed | a band of the input stack |
+| Spatial adjacency `N × N` | 5.2 | done | `adjacency_edges` |
+| Infrastructural connectivity | 5.2 | done | `connectivity_edges` |
+| Causal spatio-temporal super-graph | Fig. 2 ④ | done | `super_edge_index` |
+| Inductive GraphSAGE backbone | 5.3 | done | `SpatioTemporalGNN` |
+| Optional GAT attention | 5.3 | done | `ModelConfig(spatial_conv="gat")` |
+| Temporal module (LSTM / attention) | 5.3 | done | `build_temporal_encoder` |
+| Detection head | Fig. 2 ⑥ | done | `STGNNOutput.onset_logits` |
+| Predictive / early-warning head | Fig. 2 ⑥ | done | `STGNNOutput.horizon_logits` |
+| Weak supervision, annual → sub-annual | 5.3 | done | `WeakTemporalSupervisionLoss` |
+| Baseline: random forest | 5.4 (b) | done | `RandomForestBaseline` |
+| Baseline: non-graph temporal | 5.4 (c) | done | `TemporalBaseline` |
+| Baseline: per-pixel (node-level analogue) | 5.4 (a) | partial | `MLPBaseline` |
+| Baseline: siamese U-Net on rasters | 5.4 (a) | **absent** | different modality — not faked |
+| Baseline: EO foundation models | 5.4 (d) | **absent** | needs external weights |
+| Metrics OA / F1 / IoU / kappa | 5.4 | done | `sealing_metrics`, torchmetrics |
+| Detection delay | 5.4 | done | `detection_delay` |
+| Spatially separated train/test | 5.4 | done | `split_nodes` |
+| Sub-annual map + early alerts | Fig. 2 ⑦ | done | `predict_maps`, `rasterise` |
+| Sentinel-1 ingestion (SNAP/CDSE) | 5.1 | **absent** | see below |
+| Sentinel-2 fusion, cloud masking | 5.1 | **absent** | feature tensor is source-agnostic |
+| DEM as an auxiliary layer | Fig. 2 ① | **absent** | — |
+| Validation against ISPRA/SNPA | 5.4 | **absent** | label contract implemented, data not wired |
+| Pilot areas (Lazio, Pianura Padana) | 5.5 | **absent** | needs the data above |
+
+The modelling core of the proposal — the graph, the causal structure, the
+backbone, both heads, the weak-supervision objective and the evaluation
+protocol — is implemented and tested. What is missing is the **data plane**:
+everything upstream of a `(T, B, H, W)` raster, and the two baselines that live
+outside the node graph.
 
 ## What is not here
 
@@ -162,6 +232,7 @@ Named so that nobody mistakes the scaffold for the system:
 - **The siamese U-Net baseline** of the proposal — it works on rasters, not on
   the node graph, and a fake version would be worse than none.
 - **EO foundation models** (Prithvi/Presto/Clay) as baselines.
+- **A DEM** among the auxiliary layers.
 
 ## Tests
 
@@ -169,7 +240,7 @@ Named so that nobody mistakes the scaffold for the system:
 pytest
 ```
 
-150 tests covering graph-construction invariants, the causality and
+183 tests covering graph-construction invariants, the causality and
 monotonicity guarantees, the behaviour of each loss term, the metrics against
 scikit-learn, and an end-to-end training cycle. One is skipped unless the
 optional `segmentation` extra is installed.

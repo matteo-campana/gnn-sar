@@ -224,6 +224,10 @@ class SpatioTemporalGraph:
             ``annual_labels``.
         geometries: optional node partition, kept so predictions can be
             rasterised back to a map.
+        feature_names: optional name per channel. Feature tensors here are
+            assembled from several blocks — radar statistics, texture, static
+            attributes — and without names a 14-channel tensor is unreadable
+            the moment anyone wants to know what the model leaned on.
     """
 
     features: np.ndarray
@@ -233,6 +237,7 @@ class SpatioTemporalGraph:
     annual_labels: np.ndarray | None = None
     year_index: np.ndarray | None = None
     geometries: NodeGeometries | None = None
+    feature_names: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.features.ndim != 3:
@@ -273,6 +278,11 @@ class SpatioTemporalGraph:
                 or self.year_index.min() < 0
             ):
                 raise ValueError("year_index refers to a year outside annual_labels")
+        if self.feature_names is not None and len(self.feature_names) != self.n_features:
+            raise ValueError(
+                f"feature_names must have {self.n_features} entries, "
+                f"got {len(self.feature_names)}"
+            )
 
     @property
     def n_time(self) -> int:
@@ -323,6 +333,7 @@ class SpatioTemporalGraph:
             annual_labels=self.annual_labels,
             year_index=None if self.year_index is None else self.year_index[start:stop],
             geometries=self.geometries,
+            feature_names=self.feature_names,
         )
 
     def split_nodes(
