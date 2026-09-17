@@ -14,6 +14,15 @@ torch-geometric = "^2.8"
 torchmetrics = "^1.4"
 numpy = "^2.0"
 scipy = "^1.13"
+scikit-image = { version = "^0.24", optional = true }
+
+[tool.poetry.extras]
+# SLIC super-pixels. Without it, node geometries come from a cadastral layer
+# (NodeGeometries.from_label_image) or a regular tiling.
+segmentation = ["scikit-image"]
+
+[tool.poetry.scripts]
+gnn-sar = "gnn_sar.training.cli:main"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"
@@ -24,3 +33,12 @@ matplotlib = "^3.9"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = [
+    "ignore::FutureWarning:torch.jit._script",
+    "ignore:.*does not have many workers.*:UserWarning",
+    "ignore:.*LeafSpec.*:FutureWarning",
+]

@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install PyTorch (CPU wheels)
+        # The default wheels carry the CUDA runtime, which the runner cannot
+        # use and which does not fit in its disk budget.
+        run: pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install the project and its development dependencies
+        run: |
+          pip install -e .
+          pip install pytest scikit-learn networkx
+
+      - name: Run the test suite
+        run: pytest
