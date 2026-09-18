@@ -1,11 +1,17 @@
 """Command line entry point.
 
-Four subcommands, in the order a real study goes through them:
+Six subcommands, in the order a real study goes through them:
 
+``gnn-sar sites``
+    the pilot study areas — Roma, Viterbo, Milano — with the one grid every
+    input of an area has to land on.
 ``gnn-sar search``
     query the Copernicus Data Space Ecosystem catalogue for the Sentinel-1 and
     Sentinel-2 products covering an area and a period, and optionally download
     them.
+``gnn-sar preprocess``
+    the local ingestor: raw products through SNAP (Sentinel-1, coherence) or
+    straight onto the study grid (Sentinel-2 L2A).
 ``gnn-sar ingest``
     turn a directory of preprocessed GeoTIFFs into a cached study area — nodes,
     edges, composites, annual labels — following a JSON config.
@@ -17,7 +23,7 @@ Four subcommands, in the order a real study goes through them:
     baselines, needing no data at all. It is the fastest way to check that an
     installation works and to see what the comparison of OS3 reports.
 
-``docs/guida_dati_sentinel.md`` walks through the first three end to end.
+``docs/guida_dati_sentinel.md`` walks through the first four end to end.
 """
 
 from __future__ import annotations
@@ -42,7 +48,15 @@ from gnn_sar.models.stgnn import SpatioTemporalGNN
 from gnn_sar.training.datamodule import SpatioTemporalGraphDataModule
 from gnn_sar.training.lightning_module import SoilSealingModule
 
-__all__ = ["main", "run_demo", "run_ingest_command", "run_training", "build_parser"]
+__all__ = [
+    "main",
+    "run_demo",
+    "run_search",
+    "run_preprocess",
+    "run_ingest_command",
+    "run_training",
+    "build_parser",
+]
 
 _MODELS = {
     "stgnn": SpatioTemporalGNN,
@@ -88,10 +102,19 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--seed", type=int, default=0)
     demo.add_argument("--output", type=Path, help="write the results as JSON")
 
+    _add_sites_parser(subparsers)
     _add_search_parser(subparsers)
+    _add_preprocess_parser(subparsers)
     _add_ingest_parser(subparsers)
     _add_train_parser(subparsers)
     return parser
+
+
+def _add_sites_parser(subparsers: Any) -> None:
+    sites = subparsers.add_parser(
+        "sites", help="the pilot study areas and the grid every input must share"
+    )
+    sites.add_argument("name", nargs="?", help="show only this one")
 
 
 def _add_search_parser(subparsers: Any) -> None:
@@ -103,12 +126,15 @@ def _add_search_parser(subparsers: Any) -> None:
         "--collection", default="SENTINEL-1", choices=["SENTINEL-1", "SENTINEL-2"]
     )
     search.add_argument(
+        "--site",
+        help="a pilot area (see `gnn-sar sites`), which fills in the bounding box",
+    )
+    search.add_argument(
         "--bbox",
         nargs=4,
         type=float,
-        required=True,
         metavar=("WEST", "SOUTH", "EAST", "NORTH"),
-        help="area of interest in degrees, WGS84",
+        help="area of interest in degrees, WGS84; required unless --site is given",
     )
     search.add_argument("--start", required=True, help="first sensing date, YYYY-MM-DD")
     search.add_argument("--end", required=True, help="last sensing date (exclusive)")
@@ -136,6 +162,74 @@ def _add_search_parser(subparsers: Any) -> None:
         "and CDSE_PASSWORD)",
     )
     search.add_argument("--output", type=Path, help="write the results as JSON")
+
+
+def _add_preprocess_parser(subparsers: Any) -> None:
+    preprocess = subparsers.add_parser(
+        "preprocess",
+        help="raw Copernicus products to rasters on a study area's grid",
+    )
+    preprocess.add_argument(
+        "kind",
+        choices=["s1", "s2", "coherence"],
+        help="s1: SNAP on GRD/RTC products. s2: stack an L2A product, no SNAP. "
+        "coherence: SNAP on SLC pairs at a fixed temporal baseline",
+    )
+    preprocess.add_argument("--site", required=True, help="the study area")
+    preprocess.add_argument(
+        "--input", type=Path, required=True, help="directory of downloaded products"
+    )
+    preprocess.add_argument(
+        "--output", type=Path, required=True, help="where the aligned rasters go"
+    )
+    preprocess.add_argument(
+        "--pattern",
+        default="*",
+        help="glob selecting the products inside --input (default: everything)",
+    )
+    preprocess.add_argument(
+        "--graph", type=Path, help="SNAP graph; defaults to the one shipped in docs/esempi"
+    )
+    preprocess.add_argument("--gpt", type=Path, help="path to SNAP's gpt executable")
+    preprocess.add_argument("--memory", default="8G", help="JVM heap given to SNAP")
+    preprocess.add_argument("--threads", type=int, default=4, help="SNAP's -q")
+    preprocess.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="products processed at once; SNAP already threads internally, so "
+        "raising this mostly multiplies the memory",
+    )
+    preprocess.add_argument(
+        "--parameter",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="extra graph variable, repeatable (e.g. --parameter subswath=IW2)",
+    )
+    preprocess.add_argument(
+        "--baseline-days", type=int, default=12, help="coherence: temporal baseline"
+    )
+    preprocess.add_argument(
+        "--tolerance-days", type=int, default=2, help="coherence: baseline tolerance"
+    )
+    preprocess.add_argument(
+        "--bands",
+        nargs="+",
+        help="s2: band codes to stack (default: B02 B03 B04 B08 B11 B12)",
+    )
+    preprocess.add_argument(
+        "--no-scl",
+        action="store_true",
+        help="s2: skip the scene-classification layer. Without it nothing is "
+        "masked and cloud becomes change",
+    )
+    preprocess.add_argument("--overwrite", action="store_true")
+    preprocess.add_argument(
+        "--keep-intermediate",
+        action="store_true",
+        help="keep SNAP's own output next to the aligned raster",
+    )
 
 
 def _add_ingest_parser(subparsers: Any) -> None:
@@ -266,9 +360,28 @@ def _delay_against_truth(
     return {f"truth/delay_{key}": value for key, value in delay.items()}
 
 
+def run_sites(args: argparse.Namespace) -> str:
+    """Print the pilot areas, or one of them."""
+    from gnn_sar.data.sites import format_sites, get_site
+
+    rendered = get_site(args.name).describe() if args.name else format_sites()
+    print(rendered)
+    return rendered
+
+
 def run_search(args: argparse.Namespace) -> list[dict[str, Any]]:
     """Query the CDSE catalogue, print the products and optionally fetch them."""
     from gnn_sar.data import cdse
+
+    if args.site:
+        from gnn_sar.data.sites import get_site
+
+        bbox = list(get_site(args.site).bbox)
+    elif args.bbox:
+        bbox = list(args.bbox)
+    else:
+        raise SystemExit("give either --site or --bbox")
+    args.bbox = bbox
 
     attributes: dict[str, Any] = {}
     if args.orbit is not None:
@@ -280,7 +393,7 @@ def run_search(args: argparse.Namespace) -> list[dict[str, Any]]:
         collection=args.collection,
         start=args.start,
         end=args.end,
-        footprint_wkt=cdse.bbox_to_wkt(*args.bbox),
+        footprint_wkt=cdse.bbox_to_wkt(*bbox),
         product_type=args.product_type,
         attributes=attributes or None,
         max_cloud_cover=args.max_cloud_cover,
@@ -297,6 +410,80 @@ def run_search(args: argparse.Namespace) -> list[dict[str, Any]]:
             print(f"[{position}/{len(products)}] {destination.name}")
             cdse.download_product(product["Id"], destination, token)
     return products
+
+
+def run_preprocess(args: argparse.Namespace) -> Any:
+    """Run the local preprocessing chain for one sensor over one study area."""
+    from gnn_sar.data import preprocess as steps
+    from gnn_sar.data.sites import get_site
+
+    site = get_site(args.site)
+    products = sorted(p for p in Path(args.input).glob(args.pattern) if p.exists())
+    if not products:
+        raise SystemExit(f"no product matches {args.pattern!r} in {args.input}")
+    parameters = dict(item.split("=", 1) for item in args.parameter)
+    print(f"site   {site.name}: {site.grid().describe()}")
+    print(f"input  {len(products)} products from {args.input}")
+
+    if args.kind == "s2":
+        report = steps.preprocess_sentinel2(
+            products,
+            args.output,
+            site,
+            bands=args.bands or steps.S2_DEFAULT_BANDS,
+            scl=not args.no_scl,
+            jobs=args.jobs,
+            overwrite=args.overwrite,
+        )
+    elif args.kind == "s1":
+        report = steps.preprocess_sentinel1(
+            products,
+            args.output,
+            site,
+            graph=args.graph or _shipped_graph("snap_s1_grd_preprocessing.xml"),
+            gpt=args.gpt,
+            memory=args.memory,
+            threads=args.threads,
+            jobs=args.jobs,
+            overwrite=args.overwrite,
+            keep_intermediate=args.keep_intermediate,
+            parameters=parameters,
+        )
+    else:
+        report = steps.preprocess_coherence(
+            products,
+            args.output,
+            site,
+            graph=args.graph or _shipped_graph("snap_s1_slc_coherence.xml"),
+            baseline_days=args.baseline_days,
+            tolerance_days=args.tolerance_days,
+            gpt=args.gpt,
+            memory=args.memory,
+            threads=args.threads,
+            jobs=args.jobs,
+            overwrite=args.overwrite,
+            keep_intermediate=args.keep_intermediate,
+            parameters=parameters,
+        )
+
+    print(report.describe())
+    return report
+
+
+def _shipped_graph(name: str) -> Path:
+    """The SNAP graph that comes with the repository, if it is there.
+
+    An installed wheel carries no docs/, so a missing file is a clear message
+    rather than a confusing SNAP error.
+    """
+    candidate = Path(__file__).resolve().parents[3] / "docs" / "esempi" / name
+    if not candidate.is_file():
+        raise SystemExit(
+            f"the shipped graph {name} is not next to this installation; pass "
+            "--graph with your own (the graphs live in docs/esempi/ of the "
+            "repository)"
+        )
+    return candidate
 
 
 def run_ingest_command(args: argparse.Namespace) -> Path:
@@ -419,6 +606,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     torch.set_float32_matmul_precision("high")
 
+    if args.command == "sites":
+        run_sites(args)
+        return 0
+    if args.command == "preprocess":
+        run_preprocess(args)
+        return 0
     if args.command == "search":
         products = run_search(args)
         if args.output:

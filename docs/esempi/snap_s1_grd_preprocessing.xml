@@ -13,16 +13,21 @@
 
     gpt snap_s1_grd_preprocessing.xml \
         -Pinput=S1A_IW_GRDH_1SDV_20240117T051253_..._9A2C.SAFE.zip \
-        -Poutput=s1_rtc/S1A_IW_GRDH_1SDV_20240117T051253_9A2C.tif \
+        -Poutput=s1_snap/S1A_IW_GRDH_1SDV_20240117T051253_9A2C.tif \
+        -Pcrs=EPSG:32633 \
         -c 8G -q 4
+
+  `gnn-sar preprocess s1 --site <area>` fa questo per ogni prodotto, passa il
+  CRS dell'area pilota e poi riporta l'uscita sulla griglia esatta del sito.
 
   Il nome del file di uscita DEVE contenere la data di acquisizione
   (YYYYMMDD oppure YYYYMMDDTHHMMSS): e' da li' che l'ingestione legge il tempo.
 
-  Dopo questo passo tutte le scene vanno riportate sulla stessa griglia
-  (stessa estensione e stesso allineamento dei pixel) con gdalwarp -te -tr:
-  vedi la sezione 6 di docs/guida_dati_sentinel.md. gnn-sar rifiuta uno stack
-  non allineato invece di ricampionarlo di nascosto.
+  Dopo questo passo tutte le scene vanno riportate sulla stessa griglia (stessa
+  estensione e stesso allineamento dei pixel): lo fa `gnn-sar preprocess s1`
+  usando l'estensione del sito, oppure gdalwarp -te -tr a mano (sezione 6 di
+  docs/guida_dati_sentinel.md). gnn-sar rifiuta uno stack non allineato invece
+  di ricampionarlo di nascosto.
 -->
 <graph id="gnn-sar-s1-grd">
   <version>1.0</version>
@@ -98,9 +103,10 @@
       <demResamplingMethod>BILINEAR_INTERPOLATION</demResamplingMethod>
       <imgResamplingMethod>BILINEAR_INTERPOLATION</imgResamplingMethod>
       <pixelSpacingInMeter>10.0</pixelSpacingInMeter>
-      <!-- CRS unico per tutta l'area di studio: in Italia centrale UTM 33N.
-           Cambiarlo per un'altra zona, ma usarne UNO solo per tutta la serie. -->
-      <mapProjection>EPSG:32633</mapProjection>
+      <!-- CRS unico per tutta l'area di studio: lo passa `gnn-sar preprocess`
+           prendendolo dal sito (UTM 33N per Roma e Viterbo, 32N per Milano).
+           Usarne UNO solo per tutta la serie. -->
+      <mapProjection>${crs}</mapProjection>
       <nodataValueAtSea>false</nodataValueAtSea>
       <saveSelectedSourceBand>true</saveSelectedSourceBand>
     </parameters>

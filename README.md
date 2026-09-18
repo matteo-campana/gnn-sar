@@ -81,28 +81,45 @@ raster = scenario.geometries.rasterise(maps["sealed_probability"][-1])
 Three commands take an area from the Copernicus archive to a sub-annual map:
 
 ```bash
+# 0. the pilot areas — Roma, Viterbo, Milano — and the grid each one pins
+gnn-sar sites
+
 # 1. what exists over the area, and optionally fetch it (needs CDSE credentials)
-gnn-sar search --collection SENTINEL-1 --bbox 11.80 42.30 12.25 42.62 \
+gnn-sar search --collection SENTINEL-1 --site viterbo \
     --start 2021-01-01 --end 2024-01-01 --product-type IW_GRDH_1S \
     --orbit 22 --orbit-direction DESCENDING --download data/raw/s1
 
-# 2. preprocessed GeoTIFFs -> nodes, edges, monthly composites, annual labels
-gnn-sar ingest viterbo/ingest.json
+# 2. raw products -> rasters on the study grid (SNAP for SAR, nothing for L2A)
+gnn-sar preprocess s1 --site viterbo --input data/raw/s1 --output viterbo/s1
+gnn-sar preprocess s2 --site viterbo --input data/raw/s2 --output viterbo/s2
 
-# 3. train, and write the sub-annual products back out as GeoTIFFs
+# 3. rasters -> nodes, edges, monthly composites, annual labels, one .npz
+gnn-sar ingest docs/esempi/aree/viterbo.json
+
+# 4. train, and write the sub-annual products back out as GeoTIFFs
 gnn-sar train viterbo/cache/viterbo.npz --model stgnn --output-dir results/
 ```
 
-What sits between 1 and 2 — calibration, terrain correction, speckle filtering,
-cloud masking, putting every raster on one grid — stays in SNAP and GDAL, and is
-the part that decides whether the series measures the ground or the processing.
+Step 2 is where a time series is made or ruined — calibration, terrain
+correction, speckle filtering, cloud masking, one grid for everything — so the
+SNAP chains are versioned XML you can read and change
+([`docs/esempi/`](docs/esempi)), and the grid is a study area's, not a
+correctly typed `gdalwarp` line.
 
-**[`docs/guida_dati_sentinel.md`](docs/guida_dati_sentinel.md) (in Italian) is
-the full walkthrough**: where to register, which product to choose (GRD, RTC,
-SLC, L2A), a ready SNAP graph, how to derive land-take transitions from annual
-ISPRA/SNPA state maps, the ingestion config field by field, and the
-methodological traps — one relative orbit, one grid, segment once, `-1` is not a
-zero.
+Three documents, all in Italian:
+
+- **[`docs/guida_dati_sentinel.md`](docs/guida_dati_sentinel.md)** — the full
+  walkthrough: where to register, which product to choose (GRD, RTC, SLC, L2A),
+  the preprocessing, the ingestion config field by field, and the
+  methodological traps — one relative orbit, one grid, segment once, `-1` is
+  not a zero.
+- **[`docs/dati_etichette_ispra.md`](docs/dati_etichette_ispra.md)** — where the
+  annual labels come from, under which licence, and how their pixels are coded.
+  In the ISPRA/SNPA classification `1` is consumed soil and `2` is *not*
+  consumed soil, so "any non-zero means sealed" would label the whole country;
+  the ingestion now refuses to guess.
+- **[`docs/roadmap.md`](docs/roadmap.md)** — what is still missing, in what
+  order, and what each piece costs.
 
 ## The idea in one page
 
@@ -141,6 +158,8 @@ composites of the same labelled year does not change the loss at all.
 | --- | --- |
 | `gnn_sar.config` | Dataclass configs, JSON-serialisable, validated at construction |
 | `gnn_sar.data.cdse` | Copernicus Data Space Ecosystem: catalogue search and download |
+| `gnn_sar.data.sites` | The pilot areas, and the one grid every input of an area must share |
+| `gnn_sar.data.preprocess` | The local ingestor: SNAP for SAR and coherence, band stacking for L2A, alignment for both |
 | `gnn_sar.data.raster` | The only module that knows about a CRS: aligned GeoTIFF in, map out |
 | `gnn_sar.data.sentinel` | Sensing dates, the composite calendar, S1 dB/ratio, S2 indices and cloud mask |
 | `gnn_sar.data.segmentation` | Fixed node geometries: cadastral, regular tiling, or SLIC |
@@ -197,11 +216,15 @@ Named so that nobody mistakes the scaffold for the system:
 - **A validated run on real acquisitions.** The ingestion is exercised by tests
   against GeoTIFFs the tests themselves write; every published number still comes
   from the simulator.
-- **SAR preprocessing.** Calibration, terrain correction and despeckling stay in
-  SNAP: `docs/esempi/snap_s1_grd_preprocessing.xml` is a ready graph, but nothing
-  in this package runs it. The CDSE RTC products skip the step entirely.
-- **InSAR coherence.** It can be *consumed* as an extra band or source; computing
-  it from SLC pairs is not implemented.
+- **A verified SNAP chain.** `gnn-sar preprocess` orchestrates SNAP — finds
+  `gpt`, resumes a batch, aligns the output, reports failures — and the graphs
+  use standard operators, but neither has been run against a real product here.
+  Check the first two scenes before launching a series. The CDSE RTC products
+  skip SNAP entirely.
+- **A verified coherence chain.** Pair selection and the SLC graph are in
+  (`gnn-sar preprocess coherence`); sub-swath merging, the baseline changing
+  along a long series, and whether coherence belongs on the nodes or on the
+  temporal edges are open — see `docs/roadmap.md`.
 - **ISPRA/SNPA ground truth.** Not redistributable. What is here is the
   conversion from the annual sealed-state rasters to the land-take transitions
   the loss expects, `-1` for unknown included.
@@ -220,9 +243,10 @@ Named so that nobody mistakes the scaffold for the system:
 pytest
 ```
 
-229 tests covering graph-construction invariants, the causality and
+270 tests covering graph-construction invariants, the causality and
 monotonicity guarantees, the behaviour of each loss term, the metrics against
-scikit-learn, the date/label/ingestion accounting, and two end-to-end cycles —
+scikit-learn, the date/label/ingestion accounting, the study-area grids, the preprocessing
+around SNAP, and two end-to-end cycles —
 one on the synthetic scenario, one from GeoTIFFs to a trained model and its
 exported maps. Tests that need an optional extra are skipped without it
 (`segmentation` for SLIC, `geo` for everything that touches a GeoTIFF).

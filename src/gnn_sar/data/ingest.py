@@ -219,6 +219,11 @@ class IngestConfig:
 
     Attributes:
         sources: one entry per sensor; their channels are concatenated.
+        site: the name of a pilot area (see :mod:`gnn_sar.data.sites`). When
+            given, the rasters are checked against that area's grid before
+            anything else runs, so a wrong extent or CRS is caught on the first
+            file instead of producing a study area that quietly covers the
+            wrong ground.
         segmentation: how nodes are defined.
         period: composite length — ``"month"``, ``"dekad"`` or a number of days.
         start: force the first composite (``YYYY-MM-DD``); defaults to the
@@ -238,6 +243,7 @@ class IngestConfig:
     """
 
     sources: tuple[SourceConfig, ...] = ()
+    site: str | None = None
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     period: str | int = "month"
     start: str | None = None
@@ -367,6 +373,17 @@ def _reference_grid(
 ) -> RasterGrid:
     first = catalogue[config.sources[0].name][0][0]
     _, grid = read_raster(first, bands=[1])
+    if config.site:
+        from gnn_sar.data.sites import get_site
+
+        expected = get_site(config.site).grid()
+        if not grid.matches(expected):
+            raise ValueError(
+                f"{first.name} ({grid.describe()}) is not on the grid of the "
+                f"'{config.site}' study area ({expected.describe()}). Re-run "
+                "`gnn-sar preprocess` for this area, or drop the \"site\" key if "
+                "the area is deliberately different."
+            )
     return grid
 
 
@@ -535,11 +552,11 @@ def _read_labels(
             )
         layer = values[0]
         valid = ~np.isnan(layer)
-        sealed = (
-            np.isin(np.nan_to_num(layer, nan=-1), list(settings.sealed_values))
-            if settings.sealed_values
-            else np.nan_to_num(layer, nan=0.0) > 0
-        )
+        if settings.sealed_values:
+            sealed = np.isin(np.nan_to_num(layer, nan=-1), list(settings.sealed_values))
+        else:
+            _check_binary_codes(layer[valid], year, settings.rasters[str(year)])
+            sealed = np.nan_to_num(layer, nan=0.0) > 0
         masks.append(sealed)
         valids.append(valid)
 
@@ -557,6 +574,30 @@ def _read_labels(
         f"{int((annual == -1).sum())} unknown year-node pairs"
     )
     return {year: annual[position] for position, year in enumerate(years)}
+
+
+def _check_binary_codes(values: np.ndarray, year: int, path: str) -> None:
+    """Refuse to guess what a land-cover code means.
+
+    Without ``sealed_values`` the ingestion reads "any non-zero value" as
+    sealed, which is right for a 0/1 mask and catastrophically wrong for a
+    classified product. The ISPRA/SNPA cartography codes ``1`` as *consumed*
+    and ``2`` as *not consumed*, so that default would label the whole country
+    consumed — and nothing downstream could tell. Rather than assume, stop and
+    show what is actually in the file.
+    """
+    present = np.unique(values)
+    unexpected = present[~np.isin(present, (0.0, 1.0))]
+    if unexpected.size == 0:
+        return
+    shown = ", ".join(f"{value:g}" for value in unexpected[:10])
+    raise ValueError(
+        f"the {year} cartography ({path}) holds the values [{shown}] besides 0 and 1, "
+        "so 'any non-zero means sealed' would be a guess. Declare which codes count "
+        'as consumed, e.g. "sealed_values": [1] — in the ISPRA/SNPA classification '
+        "1 is consumed soil and 2 is *not* consumed soil, so the default would "
+        "label everything consumed. See docs/dati_etichette_ispra.md."
+    )
 
 
 def _read_corridor(

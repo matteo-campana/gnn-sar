@@ -9,8 +9,9 @@ that are not obvious.
 
 ```mermaid
 flowchart TD
+    SITE["StudySite<br/>one CRS, one extent, one pixel"] --> PREP
     CDSE["Copernicus Data Space<br/>gnn_sar.data.cdse"] --> PREP
-    PREP["SNAP / gdalwarp<br/>outside this package"] --> TIFF
+    PREP["gnn_sar.data.preprocess<br/>SNAP graph → align to the site"] --> TIFF
     TIFF["aligned GeoTIFFs<br/>one per acquisition"] --> INGEST
     INGEST["gnn_sar.data.ingest<br/>dates → PeriodGrid,<br/>bands → channels"] --> RASTER
     RASTER["Sentinel-1/2 composites<br/>(T, B, H, W)"] --> AGG
@@ -52,6 +53,20 @@ the only ones that do:
   raster sits on the same grid and refuses anything that does not, instead of
   resampling. Silent resampling is how a time series acquires a change signal
   that is not on the ground, and it is undetectable three steps later.
+- `data.sites` holds that grid. A `StudySite` is four numbers and a CRS, and
+  every other step reads them from there: the catalogue query, the SNAP
+  projection, the alignment target, and the check the ingestion runs on the
+  first file it opens. The alternative — retyping `-te` into every command — is
+  a study area that covers the wrong ground and says nothing about it.
+- `data.preprocess` is the local ingestor. It does not hide SNAP: the chain is
+  versioned XML (`docs/esempi/`), this module finds `gpt`, feeds it one product
+  at a time, resumes a batch, aligns the result to the site and **finishes the
+  batch** when a scene fails, with SNAP's own error in the report. A truncated
+  swath or a missing precise orbit is normal on a run of three hundred; stopping
+  at the first one is the wrong reaction. Sentinel-2 L2A skips SNAP entirely —
+  the work there is finding the bands in the `.SAFE` and resampling them,
+  bilinear for reflectance and nearest for the scene classification, because
+  interpolating class codes invents classes.
 - `data.sentinel` turns product names into sensing dates, sensing dates into a
   `PeriodGrid` (which also says which calendar year supervises which composite),
   and bands into channels — dB and the VV/VH ratio for SAR, SCL-masked spectral
@@ -260,6 +275,8 @@ module simply does not produce one.
 | A new baseline | Any `nn.Module` returning `STGNNOutput`; register it in `training/cli.py` |
 | Joint space-time message passing | Consume `SpatioTemporalGraph.super_edge_index` directly |
 | A different composite length | `"period": "dekad"` or a number of days; `PeriodGrid` carries the calendar |
+| A new study area | An entry in `PILOT_SITES`: bbox, CRS, extent snapped to whole pixels |
+| A different preprocessing chain | A SNAP graph of your own: `--graph`, plus `--parameter name=value`; only the variables the graph declares are passed |
 
 ## Known limits
 
@@ -275,10 +292,14 @@ module simply does not produce one.
   spread-over-time signature and weak labels — and nothing else. It is not a SAR
   simulator, and results on it are not evidence about real acquisitions.
 - The ingestion has been exercised only against GeoTIFFs the tests write
-  themselves. It is complete and it type-checks the real invariants (one grid,
-  dates from names, labels aligned to calendar years), but no run over real
-  acquisitions has been validated yet, and the SAR preprocessing it depends on
-  happens outside this package.
+  themselves. It is complete and it checks the real invariants (one grid, dates
+  from names, labels aligned to calendar years, label codes declared rather than
+  guessed), but no run over real acquisitions has been validated yet.
+- The SNAP chains are orchestrated but unverified: `gnn-sar preprocess` is
+  tested around SNAP — command construction, resumption, alignment, error
+  reporting — and never *through* it, because that needs SNAP and a real
+  product. The coherence path carries more unknowns still (sub-swath merging, a
+  baseline that changes along a long series); `docs/roadmap.md` lists them.
 - `fill_temporal_gaps` closes a cloud gap by carrying the last clear value
   forward. That is the conservative choice — it never invents a change — but it
   does mean a long optical gap shows up as a flat segment rather than as missing

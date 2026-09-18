@@ -18,6 +18,14 @@ Questa guida copre tre cose, nell'ordine in cui servono:
 > particolare il pre-processing SAR vero e proprio resta in SNAP, e nessuna
 > validazione su dati reali è stata ancora eseguita.
 
+**Documenti collegati**
+
+- [`dati_etichette_ispra.md`](dati_etichette_ispra.md) — dove prendere le
+  etichette annuali, con quale licenza e, soprattutto, come sono codificati i
+  pixel (`1` = consumato, `2` = **non** consumato: sbagliarlo etichetta tutto).
+- [`roadmap.md`](roadmap.md) — che cosa manca ancora, in che ordine, e quanto
+  costa. Ci sta anche il piano per la coerenza InSAR.
+
 **Indice**
 
 1. [Che cos'è questo repository](#1-che-cosè-questo-repository)
@@ -87,10 +95,14 @@ Gli *extras* sono opzionali e servono solo alla parte dati:
 Il cuore del pacchetto (grafo, modello, loss, metriche) resta NumPy + PyTorch e
 non richiede nessuno dei tre. Fuori da Python servono, per il pre-processing:
 
-- **ESA SNAP** (versione 10 o successive) con il comando `gpt` — solo se parti
-  dai prodotti GRD invece che dai già pronti RTC (sezione 6);
-- **GDAL** (`gdalwarp`, `gdal_rasterize`, `gdalbuildvrt`) per allineare e
-  rasterizzare.
+- **ESA SNAP** (versione 10 o successive) con il comando `gpt` — serve a
+  `gnn-sar preprocess s1` e `gnn-sar preprocess coherence`, cioè se parti dai
+  GRD o dagli SLC invece che dai già pronti RTC (sezione 6). `gnn-sar` lo cerca
+  su `PATH`, in `$GNN_SAR_GPT` e nelle installazioni tipiche; con `--gpt` glielo
+  indichi a mano;
+- **GDAL** (`gdal_rasterize`, `gdalbuildvrt`) per rasterizzare le strade e, se
+  preferisci farlo a mano, per allineare. L'allineamento alla griglia dell'area
+  lo fa comunque `gnn-sar preprocess`, via `rasterio`.
 
 Verifica dell'installazione:
 
@@ -157,6 +169,37 @@ ExperimentConfig().to_json("esperimenti/base.json")
 | **Rete stradale (OSM)** | la maschera dei corridoi, che dà senso agli archi di connettività | no, ma senza di essa la famiglia `connectivity` degrada a semplice prossimità |
 | **Layer catastale** | nodi = particelle, invece dei super-pixel | no |
 
+### 4.1 Le aree pilota, e la griglia che tiene insieme tutto
+
+Le tre aree del progetto sono definite nel codice
+(`gnn_sar.data.sites`), non nella prosa, perché il loro contenuto è la **griglia
+unica** su cui tutto il resto deve atterrare:
+
+```bash
+gnn-sar sites            # tutte e tre
+gnn-sar sites viterbo    # una sola, con la riga gdalwarp pronta
+```
+
+| area | che cos'è | griglia |
+| --- | --- | --- |
+| `roma` | frangia peri-urbana est/sud-est, a cavallo del GRA: espansione frammentata | 2730 × 2420 px, 10 m, EPSG:32633 |
+| `viterbo` | Viterbo e la sua campagna: la provincia prima per consumo annuo, trainata dal fotovoltaico a terra | 2550 × 2090 px, 10 m, EPSG:32633 |
+| `milano` | Milano sud e hinterland: il caso Pianura Padana, dove nuvole e foschia motivano l'impianto SAR-first | 2360 × 2240 px, 10 m, EPSG:32632 |
+
+Sono volutamente piccole (~25 × 22 km, 5–7 milioni di pixel): un'area di studio
+è **un solo grafo**, tenuto per intero in memoria. Per coprire una regione si
+definiscono più aree, non se ne allarga una.
+
+Milano sta in **UTM 32**, le due del Lazio in **UTM 33**: non vanno mai mescolate
+dentro la stessa area di studio. Se ti serve il cluster fotovoltaico di
+Tarquinia–Montalto di Castro, definisci una quarta area attorno a
+11.45–11.80 E, 42.20–42.45 N invece di allargare Viterbo.
+
+Aggiungerne una è una voce nel dizionario `PILOT_SITES`: bbox in gradi, CRS,
+estensione proiettata (arrotondata a un numero intero di pixel) e una nota su
+che cosa aspettarsi. Da lì derivano la query al catalogo, la griglia del
+pre-processing e il controllo che l'ingestione fa sui raster.
+
 **Il contratto di ingestione.** Qualunque sia la provenienza, `gnn-sar ingest`
 si aspetta:
 
@@ -222,7 +265,7 @@ export CDSE_PASSWORD='...'                 # mai scritte su disco dal progetto
 
 gnn-sar search \
     --collection SENTINEL-1 \
-    --bbox 11.80 42.30 12.25 42.62 \
+    --site viterbo \
     --start 2021-01-01 --end 2024-01-01 \
     --product-type IW_GRDH_1S \
     --orbit 22 --orbit-direction DESCENDING \
@@ -234,10 +277,13 @@ Stampa una riga per prodotto (data, dimensione, nome) e il volume totale, così
 sai in che cosa ti stai imbarcando prima di scaricarlo. Aggiungendo
 `--download data/raw/s1` scarica tutto in quella cartella.
 
+`--site` riempie il *bounding box* dall'area pilota; in alternativa
+`--bbox W S E N` prende quattro gradi a mano.
+
 Per Sentinel-2:
 
 ```bash
-gnn-sar search --collection SENTINEL-2 --bbox 11.80 42.30 12.25 42.62 \
+gnn-sar search --collection SENTINEL-2 --site viterbo \
     --start 2021-01-01 --end 2024-01-01 \
     --product-type S2MSI2A --max-cloud-cover 40 --limit 1000
 ```
@@ -292,18 +338,29 @@ Copernicus (nessun filtro speckle applicato: lo compensa la mediana del
 composito mensile). Restano da fare solo due cose:
 
 ```bash
-# 1. ritaglio e allineamento sulla griglia comune dell'area di studio
-gdalwarp -t_srs EPSG:32633 -tr 10 10 -te 250000 4680000 285000 4715000 \
-         -r bilinear -dstnodata nan \
-         RTC_originale.tif s1_rtc/S1C_..._20240117T051253_....tif
+# ritaglio e allineamento sulla griglia esatta dell'area pilota
+python - <<'PY'
+from pathlib import Path
+from gnn_sar.data.preprocess import align_to_site
+from gnn_sar.data.sites import get_site
 
-# 2. verifica: tutte le scene devono avere la stessa dimensione e lo stesso angolo
-gdalinfo s1_rtc/*.tif | grep -E "Size is|Origin|Pixel Size"
+site = get_site("viterbo")
+for source in sorted(Path("data/raw/rtc").glob("*.tif")):
+    align_to_site(source, Path("viterbo/s1") / source.name, site)
+PY
 ```
 
-I quattro numeri di `-te` (xmin ymin xmax ymax, nel CRS di destinazione)
-definiscono l'area di studio e vanno usati **identici per Sentinel-1,
-Sentinel-2, etichette e strade**. Scrivili una volta in una variabile di shell.
+oppure, a mano, con GDAL e i numeri che `gnn-sar sites viterbo` stampa già
+pronti:
+
+```bash
+gdalwarp $(gnn-sar sites viterbo | sed -n 's/.*gdalwarp *//p') \
+         -r bilinear -dstnodata nan RTC_originale.tif viterbo/s1/S1C_..._20240117T051253.tif
+```
+
+I quattro numeri di `-te` (xmin ymin xmax ymax, nel CRS di destinazione) sono
+quelli dell'area pilota e vanno usati **identici per Sentinel-1, Sentinel-2,
+etichette e strade**: è esattamente il motivo per cui stanno in un posto solo.
 
 ### 6.2 Percorso B — partire dai GRD con SNAP
 
@@ -312,17 +369,39 @@ orbita precisa → rimozione del rumore termico → rimozione del rumore di bord
 calibrazione σ⁰ (lineare) → filtro speckle Refined Lee → Range-Doppler Terrain
 Correction su DEM Copernicus a 10 m, CRS unico.
 
+Un comando solo fa tutto il lotto — SNAP su ogni prodotto, poi allineamento
+alla griglia dell'area:
+
 ```bash
-for zip in data/raw/s1/*.zip; do
-  stem=$(basename "$zip" .zip)
-  gpt docs/esempi/snap_s1_grd_preprocessing.xml \
-      -Pinput="$zip" -Poutput="data/s1_snap/${stem}.tif" -c 8G -q 4
-done
+gnn-sar preprocess s1 \
+    --site viterbo \
+    --input data/raw/s1 --pattern "*.zip" \
+    --output viterbo/s1 \
+    --memory 8G --threads 4
 ```
 
-Poi lo stesso `gdalwarp` della sezione 6.1 per portare tutto sulla griglia
-comune. Alternativa programmabile: [`pyroSAR`](https://pyrosar.readthedocs.io),
-che genera ed esegue grafi SNAP da Python.
+Che cosa fa, e perché è fatto così:
+
+- passa al grafo il **CRS dell'area pilota** (`${crs}`), quindi la stessa catena
+  serve Roma, Viterbo e Milano senza modifiche;
+- nomina l'uscita con la data di acquisizione, che è ciò che l'ingestione
+  rileggerà;
+- **salta** quello che è già stato fatto, così un lotto interrotto riparte da
+  dove era arrivato (`--overwrite` per rifare);
+- se una scena fallisce, la registra e **va avanti**: su trecento prodotti
+  qualcuno fallisce sempre (swath tagliato, orbita precisa non ancora
+  disponibile, download corrotto), e fermare il lotto sarebbe la reazione
+  sbagliata. Alla fine stampa `written / skipped / failed` con l'errore di SNAP;
+- `--jobs N` processa più prodotti insieme: SNAP però è già multi-thread, quindi
+  oltre due si moltiplica soprattutto la memoria;
+- `--graph tuo_grafo.xml` sostituisce la catena, `--parameter nome=valore` le
+  passa altre variabili. Vengono passate **solo** le variabili che il grafo
+  dichiara davvero, così un grafo personalizzato non riceve valori che non sa
+  usare.
+
+Alternativa programmabile per catene più complesse:
+[`pyroSAR`](https://pyrosar.readthedocs.io), che genera ed esegue grafi SNAP da
+Python.
 
 **Due avvertenze.** L'uscita resta in **potenza lineare**: la conversione in dB e
 il rapporto VV/VH li calcola `gnn-sar` in ingestione (`"linear": true`), perché
@@ -336,21 +415,73 @@ riprocessale dopo.
 
 La coerenza interferometrica è la feature che meglio separa un cantiere da un
 campo arato: crolla mentre si costruisce, risale a valori altissimi sul
-costruito finito. Si calcola in SNAP da coppie SLC della **stessa orbita
-relativa** (Read ×2 → TOPSAR-Split → Apply-Orbit-File → Back-Geocoding →
-Coherence → TOPSAR-Deburst → Terrain-Correction), tipicamente con baseline
-temporale di 6 o 12 giorni.
+costruito finito. Il backscatter da solo confonde un piazzale in terra battuta
+con un campo appena lavorato; la coerenza no.
+
+```bash
+gnn-sar preprocess coherence \
+    --site viterbo \
+    --input data/raw/slc --pattern "*.zip" \
+    --output viterbo/coh \
+    --baseline-days 12 --tolerance-days 2 \
+    --parameter subswath=IW2 --parameter polarisation=VV \
+    --memory 12G
+```
+
+Il comando sceglie le coppie a baseline costante, esegue
+[`esempi/snap_s1_slc_coherence.xml`](esempi/snap_s1_slc_coherence.xml) su
+ognuna e allinea il risultato alla griglia dell'area.
+
+Quattro cose da sapere prima di lanciarlo:
+
+1. **stessa orbita relativa**, obbligatorio: due SLC di orbite diverse non sono
+   interferabili. Scaricali con `--orbit`;
+2. **baseline costante**. La coerenza cala da sola col tempo, quindi mescolare
+   coppie a 6 e a 12 giorni mette nella serie una decorrelazione che non ha
+   nulla a che vedere con i cantieri. Il ciclo di rivisita è però cambiato nel
+   tempo, quindi una serie lunga *non* ha una baseline unica: vedi
+   [`roadmap.md`](roadmap.md), voce B1;
+3. **un sotto-swath alla volta** (`--parameter subswath=IW2`): se l'area cade a
+   cavallo di due, serve un `TOPSAR-Merge` che il grafo non fa;
+4. **la coerenza descrive un intervallo, non un istante**: il prodotto è datato
+   con la **seconda** acquisizione, l'unica scelta compatibile con la causalità
+   che il modello impone.
 
 Il risultato si dà a `gnn-sar` in due modi: come banda in più dello stesso file
 Sentinel-1 (`"bands": {"VV": 1, "VH": 2, "coherence": 3}` — la coerenza passa
 indenne, non essendo una potenza) oppure come sorgente separata di tipo `raw`.
+
 Costo: gli SLC pesano circa il quadruplo dei GRD e la catena è molto più lenta.
-Valutalo su un sotto-ambito prima di estenderlo.
+**E il grafo non è mai stato eseguito su dati veri dagli autori del
+repository**: provalo su una coppia e guarda l'uscita prima di lanciarlo su tre
+anni.
 
 ## 7. Pre-processing Sentinel-2
 
 Da L2A servono: le bande utili agli indici e il layer SCL, tutto a 10 m, sulla
-stessa griglia.
+stessa griglia. Qui SNAP non serve — L2A è già riflettanza al suolo — e il
+comando fa tutto:
+
+```bash
+gnn-sar preprocess s2 \
+    --site viterbo \
+    --input data/raw/s2 --pattern "*.SAFE" \
+    --output viterbo/s2
+```
+
+Trova le bande dentro ogni `.SAFE` (prendendo la risoluzione più fine in cui
+ciascuna è offerta), le riporta sulla griglia dell'area e le impila in un unico
+file nell'ordine `B02 B03 B04 B08 B11 B12 SCL` — cioè l'ordine che la
+configurazione di ingestione dichiara. La riflettanza è ricampionata
+**bilinearmente**, l'SCL a **nearest neighbour**: interpolare dei codici di
+classe inventerebbe classi che non esistono, e l'SCL è ciò che decide di quali
+pixel ci si fida. I prodotti vanno scompattati prima (`unzip`): le bande non
+vengono lette dentro l'archivio.
+
+Con `--bands B04 B08 B11` si accorcia l'elenco; `--no-scl` toglie la maschera, e
+senza maschera la nuvola diventa «cambiamento».
+
+A mano, con GDAL, sarebbe:
 
 ```bash
 # B02 B03 B04 B08 sono a 10 m; B11 B12 e SCL a 20 m: si ricampionano a 10 m.
@@ -358,7 +489,7 @@ gdalbuildvrt -separate -resolution user -tr 10 10 tmp/s2.vrt \
     B02.jp2 B03.jp2 B04.jp2 B08.jp2 B11.jp2 B12.jp2 SCL.jp2
 
 gdalwarp -t_srs EPSG:32633 -tr 10 10 -te $TE -r near \
-    tmp/s2.vrt s2_l2a/S2B_MSIL2A_20240117T100319_T33TTG.tif
+    tmp/s2.vrt viterbo/s2/S2B_MSIL2A_20240117T100319_T33TTG.tif
 ```
 
 Usa `-r near` per SCL (è una classificazione: interpolarla non ha senso) e, se
@@ -388,14 +519,25 @@ invece di consegnare al modello dei `NaN`.
 ### 8.1 La cartografia del consumo di suolo
 
 ISPRA/SNPA pubblica annualmente la cartografia nazionale del consumo di suolo a
-**10 m**, con l'intera serie storica, dalla pagina
-[«I dati sul consumo di suolo»](https://www.isprambiente.gov.it/it/attivita/suolo-e-territorio/suolo/il-consumo-di-suolo/i-dati-sul-consumo-di-suolo).
-Verifica la licenza dell'edizione che scarichi e le condizioni di
-ridistribuzione prima di pubblicare qualunque prodotto derivato; per le richieste
-specifiche il contatto è `consumosuolo@isprambiente.it`. Un'alternativa
-completamente aperta, a risoluzione inferiore e con semantica un po' diversa, è
-il layer **Imperviousness** degli High Resolution Layers Copernicus
-(<https://land.copernicus.eu>), utile per una prova preliminare.
+**10 m**, con l'intera serie storica (2006, 2012 e ogni anno dal 2015).
+**Dove si scarica, con quale licenza e — soprattutto — come sono codificati i
+pixel sta in [`dati_etichette_ispra.md`](dati_etichette_ispra.md)**, insieme
+alle alternative aperte (Copernicus HRL Impervious Built-Up) e alle fonti
+regionali per le tre aree pilota.
+
+Una cosa da quel documento va ripetuta qui, perché è l'errore che rovina un
+esperimento senza dare segnali: nella classificazione ISPRA **`1` significa
+suolo consumato e `2` significa suolo NON consumato**. Il default «qualsiasi
+valore diverso da zero è sigillato» etichetterebbe come consumato l'intero
+territorio. Con un raster ISPRA va sempre dichiarato:
+
+```json
+"labels": { "rasters": {...}, "sealed_values": [1] }
+```
+
+Dalla versione corrente l'ingestione **si rifiuta di indovinare**: se trova
+valori diversi da 0 e 1 senza che `sealed_values` sia stato dichiarato, si ferma
+ed elenca i valori trovati.
 
 Porta ogni anno sulla griglia di studio, con lo stesso `-te` di tutto il resto:
 
@@ -457,10 +599,10 @@ si assottiglia.
 ```
 viterbo/
 ├── ingest.json                     # la configurazione (sotto)
-├── s1_rtc/                         # un GeoTIFF per acquisizione, VV+VH lineari
+├── s1/                             # un GeoTIFF per acquisizione, VV+VH lineari
 │   ├── S1C_IW_GRDH_1SDV_20210112T051253_....tif
 │   └── ...
-├── s2_l2a/                         # un GeoTIFF per acquisizione, 6 bande + SCL
+├── s2/                             # un GeoTIFF per acquisizione, 6 bande + SCL
 │   └── S2B_MSIL2A_20210117T100319_T33TTG.tif
 ├── labels/
 │   ├── consumo_suolo_2020.tif      # stato sigillato, un raster per anno
@@ -471,11 +613,14 @@ viterbo/
 
 ### 9.2 La configurazione
 
-L'esempio completo e commentato è in
-[`esempi/ingest_viterbo.json`](esempi/ingest_viterbo.json). Campo per campo:
+Le tre aree pilota hanno una configurazione pronta e commentata:
+[`esempi/aree/roma.json`](esempi/aree/roma.json),
+[`esempi/aree/viterbo.json`](esempi/aree/viterbo.json),
+[`esempi/aree/milano.json`](esempi/aree/milano.json). Campo per campo:
 
 | campo | significato |
 | --- | --- |
+| `site` | il nome dell'area pilota. Quando c'è, i raster vengono confrontati con la griglia di quell'area **prima** di qualunque altra cosa: un'estensione o un CRS sbagliati si scoprono sul primo file, non a fine ingestione |
 | `sources[].kind` | `sentinel1` (dB + rapporto VV/VH), `sentinel2` (maschera SCL + indici), `raw` (bande così come sono) |
 | `sources[].directory`, `pattern` | dove sono i file e quali prendere; i percorsi sono relativi alla cartella del config |
 | `sources[].bands` | nome della banda → indice **1-based** nel file |
@@ -487,7 +632,7 @@ L'esempio completo e commentato è in
 | `segmentation` | `grid` (tassellatura regolare, `block` pixel di lato), `slic` (super-pixel su composito multitemporale), `labels` (raster catastale) |
 | `period`, `start`, `n_periods` | l'asse dei compositi: `"month"`, `"dekad"` o un numero di giorni |
 | `statistics` | statistiche per nodo di ogni canale: `mean` è il livello, `std` la dispersione interna al nodo, che fa da tessitura |
-| `labels` | i raster annuali di stato e le soglie della sezione 8.1 |
+| `labels` | i raster annuali di stato, `sealed_values` (obbligatorio con la codifica ISPRA) e le soglie della sezione 8.1 |
 | `corridor` | la maschera stradale |
 | `graph` | `n_neighbors`, `connectivity_radius`, `temporal_order` |
 | `output` | dove scrivere la cache `.npz` |
@@ -498,7 +643,7 @@ JSON.
 ### 9.3 Esecuzione
 
 ```bash
-gnn-sar ingest viterbo/ingest.json
+gnn-sar ingest docs/esempi/aree/viterbo.json
 ```
 
 Stampa, mentre lavora, quello che serve a controllarlo:
@@ -662,14 +807,16 @@ Per non scambiare l'impalcatura per il sistema:
 - **nessuna validazione su dati reali.** Tutto ciò che è descritto qui è
   testato su GeoTIFF sintetici scritti dai test; i numeri pubblicati nel README
   vengono dal simulatore;
-- **il pre-processing SAR non è automatizzato** dentro il progetto: il grafo SNAP
-  è fornito come esempio ma va eseguito da fuori, e non c'è wrapper Python;
-- **niente calcolo della coerenza InSAR**: si può solo dare in input un layer già
-  calcolato;
+- **le catene SNAP non sono mai state eseguite su prodotti veri** dagli autori:
+  `gnn-sar preprocess` le orchestra (ricerca di `gpt`, ripresa, allineamento,
+  rapporto sugli errori) e i grafi usano operatori standard, ma vanno verificati
+  sulle prime due scene prima di lanciarli su una serie intera;
 - **la baseline U-Net siamese** della proposta e i *foundation model* EO
   (Prithvi/Presto/Clay) non sono implementati;
 - **nessun sampling di vicinato**: aree grandi vanno spezzate a mano;
 - **la maschera di corridoio** va rasterizzata fuori dal progetto (GDAL/OSM);
+- **niente merge di sotto-swath** per la coerenza, e nessuna normalizzazione
+  della coerenza rispetto a baseline diverse (vedi [`roadmap.md`](roadmap.md));
 - **la testa di early-warning addestrata su etichette annuali è grossolana**: un
   bersaglio annuale non sa localizzare la transizione, quindi resta a 1 per tutto
   l'anno. Impara «una transizione è vicina», non «fra `k` compositi». Dove
@@ -691,6 +838,11 @@ Per non scambiare l'impalcatura per il sistema:
 | `set CDSE_USERNAME and CDSE_PASSWORD ...` | credenziali non esportate nell'ambiente |
 | `CDSE refused the credentials (401)` | password sbagliata, o account non ancora attivato via email |
 | `slic_geometries requires scikit-image` | `poetry install --extras segmentation`, oppure usa `"method": "grid"` |
+| `... holds the values [...] besides 0 and 1` | il raster delle etichette è classificato, non binario: dichiara `sealed_values` (con ISPRA, `[1]`) |
+| `... is not on the grid of the '<area>' study area` | i raster non stanno sulla griglia dichiarata in `"site"`: rilancia `gnn-sar preprocess` per quell'area |
+| `ESA SNAP's gpt was not found` | installa SNAP, mettilo su `PATH`, esporta `GNN_SAR_GPT` o passa `--gpt` |
+| `no file found for ['B11', 'B12']` | il prodotto Sentinel-2 non è stato scompattato, o mancano le bande a 20 m |
+| `unknown site 'firenze'` | le aree pilota sono `roma`, `viterbo`, `milano`; aggiungerne una è una voce in `PILOT_SITES` |
 
 ## 15. Licenze e citazioni dei dati
 

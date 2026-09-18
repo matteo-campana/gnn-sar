@@ -1,0 +1,168 @@
+<!--
+  Coerenza InSAR da coppie Sentinel-1 SLC (IW), per gnn-sar.
+
+  Catena: split del sotto-swath -> orbite precise -> co-registrazione
+  (Back-Geocoding + Enhanced Spectral Diversity) -> Coherence -> deburst ->
+  Terrain Correction sulla stessa proiezione dell'area di studio.
+
+  Uso (una coppia alla volta; il comando `gnn-sar preprocess coherence` seleziona
+  le coppie e chiama questo grafo per ognuna):
+
+    gpt snap_s1_slc_coherence.xml \
+        -Pinput1=S1C_IW_SLC__1SDV_20240105T051253_..._.SAFE.zip \
+        -Pinput2=S1C_IW_SLC__1SDV_20240117T051253_..._.SAFE.zip \
+        -Poutput=coh/COH_20240117T051253_12d.tif \
+        -Psubswath=IW2 -Ppolarisation=VV -Pcrs=EPSG:32633 \
+        -c 12G -q 4
+
+  LIMITI DA CONOSCERE PRIMA DI USARLO
+
+  1. Le due acquisizioni devono appartenere alla STESSA ORBITA RELATIVA e allo
+     stesso passaggio: due SLC di orbite diverse non sono interferabili.
+     Scaricale con `gnn-sar search --orbit <n> --orbit-direction ...`.
+  2. Un sotto-swath alla volta. Un'area di ~25 km di solito ci sta dentro, ma
+     se cade a cavallo di due sotto-swath servono due esecuzioni piu' un
+     TOPSAR-Merge, che questo grafo NON fa.
+  3. La baseline temporale va tenuta costante (6 o 12 giorni a seconda della
+     configurazione della costellazione nel periodo): la coerenza cala da sola
+     col tempo, quindi mescolare baseline diverse mette nella serie una
+     decorrelazione che non ha nulla a che vedere con i cantieri.
+  4. La coerenza descrive un INTERVALLO, non un istante. Il prodotto e' datato
+     con la seconda acquisizione: e' l'unica scelta compatibile con la
+     causalita' che il modello impone (nulla al tempo t puo' dipendere dal
+     futuro).
+  5. Costo: gli SLC pesano circa quattro volte i GRD e questa catena e' molto
+     piu' lenta della catena GRD. Provala su un mese prima di lanciarla su tre
+     anni.
+  6. Questo grafo NON e' stato eseguito end-to-end dagli autori del repository:
+     e' scritto sulle operazioni standard di SNAP e va verificato sui primi due
+     prodotti veri prima di fidarsene (vedi docs/roadmap.md).
+-->
+<graph id="gnn-sar-s1-slc-coherence">
+  <version>1.0</version>
+
+  <node id="Read-1">
+    <operator>Read</operator>
+    <parameters>
+      <file>${input1}</file>
+    </parameters>
+  </node>
+
+  <node id="Read-2">
+    <operator>Read</operator>
+    <parameters>
+      <file>${input2}</file>
+    </parameters>
+  </node>
+
+  <node id="Split-1">
+    <operator>TOPSAR-Split</operator>
+    <sources><sourceProduct refid="Read-1"/></sources>
+    <parameters>
+      <subswath>${subswath}</subswath>
+      <selectedPolarisations>${polarisation}</selectedPolarisations>
+    </parameters>
+  </node>
+
+  <node id="Split-2">
+    <operator>TOPSAR-Split</operator>
+    <sources><sourceProduct refid="Read-2"/></sources>
+    <parameters>
+      <subswath>${subswath}</subswath>
+      <selectedPolarisations>${polarisation}</selectedPolarisations>
+    </parameters>
+  </node>
+
+  <node id="Orbit-1">
+    <operator>Apply-Orbit-File</operator>
+    <sources><sourceProduct refid="Split-1"/></sources>
+    <parameters>
+      <orbitType>Sentinel Precise (Auto Download)</orbitType>
+      <polyDegree>3</polyDegree>
+      <!-- Per l'interferometria le orbite precise non sono opzionali. -->
+      <continueOnFail>false</continueOnFail>
+    </parameters>
+  </node>
+
+  <node id="Orbit-2">
+    <operator>Apply-Orbit-File</operator>
+    <sources><sourceProduct refid="Split-2"/></sources>
+    <parameters>
+      <orbitType>Sentinel Precise (Auto Download)</orbitType>
+      <polyDegree>3</polyDegree>
+      <continueOnFail>false</continueOnFail>
+    </parameters>
+  </node>
+
+  <node id="Back-Geocoding">
+    <operator>Back-Geocoding</operator>
+    <sources>
+      <sourceProduct refid="Orbit-1"/>
+      <sourceProduct.1 refid="Orbit-2"/>
+    </sources>
+    <parameters>
+      <demName>Copernicus 30m Global DEM</demName>
+      <demResamplingMethod>BICUBIC_INTERPOLATION</demResamplingMethod>
+      <resamplingType>BISINC_5_POINT_INTERPOLATION</resamplingType>
+      <maskOutAreaWithoutElevation>true</maskOutAreaWithoutElevation>
+    </parameters>
+  </node>
+
+  <node id="Enhanced-Spectral-Diversity">
+    <operator>Enhanced-Spectral-Diversity</operator>
+    <sources><sourceProduct refid="Back-Geocoding"/></sources>
+    <parameters>
+      <!-- Raffina la co-registrazione in azimut: senza, i salti fra burst
+           lasciano frange che si leggono come perdita di coerenza. -->
+      <esdEstimator>Periodogram</esdEstimator>
+      <weightFunc>Inv Quadratic</weightFunc>
+    </parameters>
+  </node>
+
+  <node id="Coherence">
+    <operator>Coherence</operator>
+    <sources><sourceProduct refid="Enhanced-Spectral-Diversity"/></sources>
+    <parameters>
+      <!-- Finestra di stima: piu' grande = meno rumore ma meno dettaglio.
+           10x3 (range x azimut) e' un compromesso comune per IW a 5x20 m. -->
+      <cohWinRg>10</cohWinRg>
+      <cohWinAz>3</cohWinAz>
+      <subtractFlatEarthPhase>true</subtractFlatEarthPhase>
+      <subtractTopographicPhase>false</subtractTopographicPhase>
+      <singleMaster>true</singleMaster>
+    </parameters>
+  </node>
+
+  <node id="TOPSAR-Deburst">
+    <operator>TOPSAR-Deburst</operator>
+    <sources><sourceProduct refid="Coherence"/></sources>
+    <parameters>
+      <selectedPolarisations>${polarisation}</selectedPolarisations>
+    </parameters>
+  </node>
+
+  <node id="Terrain-Correction">
+    <operator>Terrain-Correction</operator>
+    <sources><sourceProduct refid="TOPSAR-Deburst"/></sources>
+    <parameters>
+      <demName>Copernicus 30m Global DEM</demName>
+      <demResamplingMethod>BILINEAR_INTERPOLATION</demResamplingMethod>
+      <imgResamplingMethod>BILINEAR_INTERPOLATION</imgResamplingMethod>
+      <!-- Stesso passo e stessa proiezione della catena GRD: la coerenza deve
+           finire sulla stessa griglia del backscatter. -->
+      <pixelSpacingInMeter>10.0</pixelSpacingInMeter>
+      <mapProjection>${crs}</mapProjection>
+      <nodataValueAtSea>false</nodataValueAtSea>
+      <saveSelectedSourceBand>true</saveSelectedSourceBand>
+    </parameters>
+  </node>
+
+  <node id="Write">
+    <operator>Write</operator>
+    <sources><sourceProduct refid="Terrain-Correction"/></sources>
+    <parameters>
+      <file>${output}</file>
+      <formatName>GeoTIFF</formatName>
+    </parameters>
+  </node>
+</graph>

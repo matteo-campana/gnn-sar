@@ -1,10 +1,10 @@
 """Phase 1–2: from Sentinel rasters to a spatio-temporal graph.
 
-The geospatial entry points (:mod:`gnn_sar.data.raster`,
-:mod:`gnn_sar.data.ingest`) and the catalogue client
-(:mod:`gnn_sar.data.cdse`) are *not* re-exported here: they need optional
-dependencies, and importing this package must stay cheap and pure-NumPy. Import
-them from their own modules.
+The modules that need an optional dependency — :mod:`gnn_sar.data.raster` and
+:mod:`gnn_sar.data.ingest` (rasterio), :mod:`gnn_sar.data.preprocess` (rasterio
+and ESA SNAP), :mod:`gnn_sar.data.cdse` (requests) — are *not* re-exported here:
+importing this package must stay cheap and pure-NumPy. Import them from their
+own modules.
 """
 
 from gnn_sar.data.features import (
@@ -36,6 +36,7 @@ from gnn_sar.data.segmentation import (
     aggregate_stack,
     slic_geometries,
 )
+from gnn_sar.data.sites import PILOT_SITES, StudySite, get_site
 from gnn_sar.data.sentinel import (
     PeriodGrid,
     scl_valid_mask,
@@ -62,10 +63,12 @@ __all__ = [
     "EDGE_TEMPORAL",
     "FeatureStandardizer",
     "NodeGeometries",
+    "PILOT_SITES",
     "PeriodGrid",
     "SourceStack",
     "SpatioTemporalGraph",
     "StudyArea",
+    "StudySite",
     "SyntheticLandTakeScenario",
     "adjacency_edges",
     "aggregate_stack",
@@ -77,6 +80,7 @@ __all__ = [
     "connectivity_edges",
     "corridor_from_raster",
     "fill_temporal_gaps",
+    "get_site",
     "load_study_area",
     "make_synthetic_scenario",
     "node_fraction",

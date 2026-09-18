@@ -102,15 +102,24 @@ def test_a_comment_key_is_ignored_so_a_config_can_be_annotated():
     assert config.sources[0].name == "s1"
 
 
-def test_the_shipped_example_config_is_valid():
+@pytest.mark.parametrize("area", ["roma", "viterbo", "milano"])
+def test_the_shipped_configs_of_the_pilot_areas_are_valid(area):
     from pathlib import Path
 
-    example = Path(__file__).resolve().parents[1] / "docs/esempi/ingest_viterbo.json"
+    from gnn_sar.data.sites import get_site
+
+    example = Path(__file__).resolve().parents[1] / f"docs/esempi/aree/{area}.json"
 
     config = IngestConfig.from_json(example)
 
+    assert config.site == area
     assert [source.name for source in config.sources] == ["s1", "s2"]
     assert config.labels is not None and len(config.labels.rasters) == 4
+    # The ISPRA codes must be declared: 2 means *not* consumed there.
+    assert config.labels.sealed_values == (1,)
+    # A first full-batch run wants nodes an order of magnitude below the pixels.
+    height, width = get_site(area).shape
+    assert 10_000 < config.segmentation.n_segments < height * width / 100
 
 
 def test_the_ingestion_produces_a_graph_the_datamodule_can_train_on(area_root):
@@ -210,3 +219,40 @@ def test_nodes_can_come_from_slic_over_a_multitemporal_composite(area_root):
     assert area.geometries.n_nodes > 1
     assert area.geometries.shape == (SIZE, SIZE)
     assert area.graph.features.shape[:2] == (24, area.geometries.n_nodes)
+
+
+def test_a_classified_cartography_is_not_read_as_a_binary_mask(area_root):
+    """The ISPRA trap: 1 is consumed soil, 2 is *not* consumed soil."""
+    ispra = np.full((SIZE, SIZE), 2.0)  # not consumed
+    ispra[SEALED] = 1.0  # consumed
+    write_raster(area_root / "labels" / "consumo_2023.tif", ispra, GRID, nodata=None)
+
+    with pytest.raises(ValueError, match=r"besides 0 and 1.*sealed_values"):
+        run_ingest(_config(area_root), verbose=False)
+
+
+def test_declaring_the_consumed_codes_resolves_it(area_root):
+    ispra = np.full((SIZE, SIZE), 2.0)
+    ispra[SEALED] = 1.0
+    write_raster(area_root / "labels" / "consumo_2023.tif", ispra, GRID, nodata=None)
+    write_raster(
+        area_root / "labels" / "consumo_2022.tif",
+        np.full((SIZE, SIZE), 2.0),
+        GRID,
+        nodata=None,
+    )
+    config = _config(
+        area_root,
+        labels={
+            "rasters": {
+                "2022": "labels/consumo_2022.tif",
+                "2023": "labels/consumo_2023.tif",
+            },
+            "sealed_values": [1],
+        },
+    )
+
+    area = run_ingest(config, verbose=False)
+
+    assert area.graph.annual_labels[1, 0] == 1  # node 0 consumed during 2023
+    assert (area.graph.annual_labels[:, 1:] == 0).all()
