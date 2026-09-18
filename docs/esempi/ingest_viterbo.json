@@ -1,0 +1,57 @@
+{
+  "//": "Area pilota Viterbo — Sentinel-1 RTC mensile + Sentinel-2 L2A, etichette ISPRA/SNPA. Vedi docs/guida_dati_sentinel.md, sezione 9.",
+  "sources": [
+    {
+      "name": "s1",
+      "kind": "sentinel1",
+      "directory": "s1_rtc",
+      "pattern": "*.tif",
+      "bands": { "VV": 1, "VH": 2 },
+      "linear": true,
+      "ratio": true,
+      "reducer": "median"
+    },
+    {
+      "name": "s2",
+      "kind": "sentinel2",
+      "directory": "s2_l2a",
+      "pattern": "*.tif",
+      "bands": { "B02": 1, "B03": 2, "B04": 3, "B08": 4, "B11": 5, "B12": 6 },
+      "scl_band": 7,
+      "scale": 0.0001,
+      "indices": ["ndvi", "ndbi", "bsi"],
+      "reducer": "median"
+    }
+  ],
+  "segmentation": {
+    "method": "slic",
+    "n_segments": 6000,
+    "compactness": 8.0,
+    "composites": 8
+  },
+  "period": "month",
+  "start": "2021-01-01",
+  "statistics": ["mean", "std"],
+  "labels": {
+    "rasters": {
+      "2020": "labels/consumo_suolo_2020.tif",
+      "2021": "labels/consumo_suolo_2021.tif",
+      "2022": "labels/consumo_suolo_2022.tif",
+      "2023": "labels/consumo_suolo_2023.tif"
+    },
+    "band": 1,
+    "threshold": 0.5,
+    "min_coverage": 0.5,
+    "pre_existing": "ignore"
+  },
+  "corridor": {
+    "raster": "osm/strade_buffer50m.tif",
+    "min_fraction": 0.0
+  },
+  "graph": {
+    "n_neighbors": 4,
+    "connectivity_radius": 40.0,
+    "temporal_order": 1
+  },
+  "output": "cache/viterbo.npz"
+}

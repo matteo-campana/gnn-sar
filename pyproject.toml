@@ -15,17 +15,28 @@ torchmetrics = "^1.4"
 numpy = "^2.0"
 scipy = "^1.13"
 scikit-image = { version = "^0.24", optional = true }
+rasterio = { version = "^1.3", optional = true }
+requests = { version = "^2.31", optional = true }
 
 [tool.poetry.extras]
 # SLIC super-pixels. Without it, node geometries come from a cadastral layer
 # (NodeGeometries.from_label_image) or a regular tiling.
 segmentation = ["scikit-image"]
+# Reading the preprocessed GeoTIFFs of a real study area and writing the
+# sub-annual maps back out (`gnn-sar ingest`, `gnn-sar train --output-dir`).
+geo = ["rasterio"]
+# Searching and downloading from the Copernicus Data Space Ecosystem
+# (`gnn-sar search`).
+download = ["requests"]
+# Everything needed to go from the archive to a map.
+all = ["scikit-image", "rasterio", "requests"]
 
 [tool.poetry.scripts]
 gnn-sar = "gnn_sar.training.cli:main"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"
+rasterio = "^1.3"
 scikit-learn = "^1.5"
 networkx = "^3.3"
 matplotlib = "^3.9"

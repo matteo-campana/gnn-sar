@@ -5,8 +5,11 @@ The package mirrors the five phases of the research proposal in ``docs/``:
 ============  ==========================================================
 Phase         Module
 ============  ==========================================================
-1 data        :mod:`gnn_sar.data.features`, :mod:`gnn_sar.data.synthetic`
-2 graph       :mod:`gnn_sar.data.segmentation`, :mod:`gnn_sar.data.graph`
+0 archive     :mod:`gnn_sar.data.cdse`, :mod:`gnn_sar.data.raster`
+1 data        :mod:`gnn_sar.data.sentinel`, :mod:`gnn_sar.data.features`,
+              :mod:`gnn_sar.data.synthetic`
+2 graph       :mod:`gnn_sar.data.segmentation`, :mod:`gnn_sar.data.graph`,
+              :mod:`gnn_sar.data.labels`, :mod:`gnn_sar.data.study_area`
 3 model       :mod:`gnn_sar.models`, :mod:`gnn_sar.losses`
 4 validation  :mod:`gnn_sar.metrics`, :mod:`gnn_sar.models.baselines`
 5 training    :mod:`gnn_sar.training`
@@ -31,6 +34,10 @@ _LAZY: dict[str, str] = {
     "ExperimentConfig": "gnn_sar.config",
     "SpatioTemporalGraph": "gnn_sar.data.graph",
     "NodeGeometries": "gnn_sar.data.segmentation",
+    "PeriodGrid": "gnn_sar.data.sentinel",
+    "StudyArea": "gnn_sar.data.study_area",
+    "build_study_area": "gnn_sar.data.study_area",
+    "load_study_area": "gnn_sar.data.study_area",
     "SyntheticLandTakeScenario": "gnn_sar.data.synthetic",
     "make_synthetic_scenario": "gnn_sar.data.synthetic",
     # models
@@ -53,6 +60,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     )
     from gnn_sar.data.graph import SpatioTemporalGraph
     from gnn_sar.data.segmentation import NodeGeometries
+    from gnn_sar.data.sentinel import PeriodGrid
+    from gnn_sar.data.study_area import (
+        StudyArea,
+        build_study_area,
+        load_study_area,
+    )
     from gnn_sar.data.synthetic import (
         SyntheticLandTakeScenario,
         make_synthetic_scenario,

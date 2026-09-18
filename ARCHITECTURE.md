@@ -9,7 +9,11 @@ that are not obvious.
 
 ```mermaid
 flowchart TD
-    RASTER["Sentinel-1 composites<br/>(T, B, H, W)"] --> AGG
+    CDSE["Copernicus Data Space<br/>gnn_sar.data.cdse"] --> PREP
+    PREP["SNAP / gdalwarp<br/>outside this package"] --> TIFF
+    TIFF["aligned GeoTIFFs<br/>one per acquisition"] --> INGEST
+    INGEST["gnn_sar.data.ingest<br/>dates → PeriodGrid,<br/>bands → channels"] --> RASTER
+    RASTER["Sentinel-1/2 composites<br/>(T, B, H, W)"] --> AGG
     GEOM["NodeGeometries<br/>cadastral / SLIC / tiling<br/>fixed for the whole series"] --> AGG
     AGG["aggregate_stack<br/>per-segment mean, std, min, max"] --> FEAT["features (T, N, D)"]
 
@@ -20,7 +24,9 @@ flowchart TD
 
     FEAT --> GRAPH["SpatioTemporalGraph"]
     EDGES --> GRAPH
-    LABELS["annual_labels (Y, N)<br/>ISPRA/SNPA, -1 = unknown"] --> GRAPH
+    ISPRA["ISPRA/SNPA yearly<br/>sealed-state rasters"] --> LAB
+    LAB["gnn_sar.data.labels<br/>state → transition"] --> LABELS
+    LABELS["annual_labels (Y, N)<br/>1 = consumed that year, -1 = unknown"] --> GRAPH
 
     GRAPH --> DM["SpatioTemporalGraphDataModule<br/>geographic split, standardisation,<br/>horizon targets"]
     DM --> MODEL["SpatioTemporalGNN<br/>spatial stage → temporal stage"]
@@ -31,6 +37,49 @@ flowchart TD
 ```
 
 ## Layers of the design
+
+### 0. The archive is not the dataset
+
+Everything from `(T, B, H, W)` onwards is plain NumPy and knows nothing about
+coordinate reference systems. Three modules sit upstream of that line and are
+the only ones that do:
+
+- `data.cdse` asks the Copernicus catalogue what exists and fetches it. The
+  query builders are pure strings and tested; the two functions that speak HTTP
+  are deliberately thin, so a failure is a readable HTTP error rather than a
+  retry layer hiding one.
+- `data.raster` reads GeoTIFFs and writes maps back. It **checks** that every
+  raster sits on the same grid and refuses anything that does not, instead of
+  resampling. Silent resampling is how a time series acquires a change signal
+  that is not on the ground, and it is undetectable three steps later.
+- `data.sentinel` turns product names into sensing dates, sensing dates into a
+  `PeriodGrid` (which also says which calendar year supervises which composite),
+  and bands into channels — dB and the VV/VH ratio for SAR, SCL-masked spectral
+  indices for optical.
+
+`data.ingest` composes them under a JSON config, and does it **one composite at
+a time**: read the month's acquisitions, reduce, pool onto the nodes, free the
+pixels. A 35 × 35 km area over three years is tens of gigabytes as a pixel
+stack and a few megabytes as `(T, N, D)`, so the peak memory is set by the
+densest month rather than by the length of the series. `data.study_area` is the
+same assembly at library level, for callers that already hold arrays, plus the
+`.npz` cache that lets the expensive ingestion run once.
+
+Two conversions in this layer are the ones that quietly decide whether an
+experiment means anything, and both live in `data.labels`:
+
+**State is not transition.** ISPRA/SNPA says where the soil *is* sealed each
+year. The loss needs to know *when* it *became* sealed, so
+`annual_land_take_labels` marks 1 only in the year of the change, 0 before and
+after, and propagates `-1` through any gap that could hide the transition. Land
+already sealed in the first year is excluded by default: there is no onset to
+find inside the window, and labelling it 1 would teach the model to fire on
+stable built-up land.
+
+**A node is not a pixel.** A super-pixel or a parcel rarely flips all at once,
+so `node_fraction` measures how much of it a mask covers and the caller sets the
+threshold. Nodata lowers a node's *coverage* rather than counting as zeros, and
+a node whose coverage is too low has no state at all.
 
 ### 1. Node geometries are computed once
 
@@ -201,13 +250,16 @@ module simply does not produce one.
 
 | To add | Where |
 | --- | --- |
-| Real Sentinel-1 | Produce `(T, B, H, W)` composites; `composite_by_period` already regularises an irregular revisit |
-| Cadastral nodes | `NodeGeometries.from_label_image(rasterised_parcels)` |
-| Sentinel-2 fusion | Concatenate optical channels into the `(T, N, D)` feature tensor |
-| Real road corridors | Pass an OSM-derived `corridor` mask to `build_spatial_edges` |
+| Real Sentinel-1 | A directory of preprocessed GeoTIFFs and a `SourceConfig` of kind `sentinel1`; see `docs/guida_dati_sentinel.md` |
+| Sentinel-2 fusion | A second `SourceConfig` of kind `sentinel2`; its indices become extra channels of the same `(T, N, D)` tensor |
+| InSAR coherence | Stack it as a band of the Sentinel-1 file (`"coherence"`) or add it as a `raw` source; computing it is still a SNAP job |
+| Another sensor entirely | A `SourceConfig` of kind `raw`, or a `SourceStack` built by hand |
+| Cadastral nodes | `"segmentation": {"method": "labels", "raster": ...}`, or `NodeGeometries.from_label_image` |
+| Real road corridors | `"corridor": {"raster": ...}`, or pass a `(N,)` mask to `build_spatial_edges` |
+| Real annual labels | One sealed-state raster per year under `"labels"`, or a `(Y, N)` int array with `-1` for unknown |
 | A new baseline | Any `nn.Module` returning `STGNNOutput`; register it in `training/cli.py` |
 | Joint space-time message passing | Consume `SpatioTemporalGraph.super_edge_index` directly |
-| Real annual labels | `(Y, N)` int array, `-1` for unknown, plus a `(T,)` `year_index` |
+| A different composite length | `"period": "dekad"` or a number of days; `PeriodGrid` carries the calendar |
 
 ## Known limits
 
@@ -222,3 +274,12 @@ module simply does not produce one.
 - The synthetic generator reproduces topological propagation, a
   spread-over-time signature and weak labels — and nothing else. It is not a SAR
   simulator, and results on it are not evidence about real acquisitions.
+- The ingestion has been exercised only against GeoTIFFs the tests write
+  themselves. It is complete and it type-checks the real invariants (one grid,
+  dates from names, labels aligned to calendar years), but no run over real
+  acquisitions has been validated yet, and the SAR preprocessing it depends on
+  happens outside this package.
+- `fill_temporal_gaps` closes a cloud gap by carrying the last clear value
+  forward. That is the conservative choice — it never invents a change — but it
+  does mean a long optical gap shows up as a flat segment rather than as missing
+  data, and the model has no channel telling it which is which.

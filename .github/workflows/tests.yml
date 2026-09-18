@@ -25,9 +25,11 @@ jobs:
         run: pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install the project and its development dependencies
+        # rasterio brings the geo extra, so the GeoTIFF ingestion tests run
+        # instead of being skipped.
         run: |
           pip install -e .
-          pip install pytest scikit-learn networkx
+          pip install pytest scikit-learn networkx rasterio
 
       - name: Run the test suite
         run: pytest

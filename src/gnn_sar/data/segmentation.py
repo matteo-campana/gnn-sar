@@ -113,6 +113,7 @@ def aggregate_stack(
     stack: np.ndarray,
     geometries: NodeGeometries,
     statistics: Sequence[str] = ("mean", "std"),
+    nan_policy: str = "propagate",
 ) -> np.ndarray:
     """Pool a pixel-level raster stack onto the node set.
 
@@ -120,6 +121,13 @@ def aggregate_stack(
         stack: ``(T, B, H, W)`` array of ``B`` bands over ``T`` composites.
         geometries: the fixed node partition.
         statistics: any of ``mean``, ``std``, ``min``, ``max``.
+        nan_policy: what a masked pixel does to its node. ``"propagate"`` (the
+            default) lets one ``NaN`` make the whole node ``NaN``, which is the
+            right answer for Sentinel-1: a hole there means the node was not
+            observed. ``"omit"`` pools over the valid pixels only and is what
+            cloud-masked Sentinel-2 needs — a node half covered by cloud is
+            still measured by its clear half, and only a node with no valid
+            pixel at all comes out ``NaN``.
 
     Returns:
         ``(T, N, B * len(statistics))`` feature tensor, with the statistics of
@@ -131,6 +139,10 @@ def aggregate_stack(
     unknown = [s for s in statistics if s not in _STATISTICS]
     if unknown:
         raise ValueError(f"unknown statistics {unknown}, expected any of {_STATISTICS}")
+    if nan_policy not in ("propagate", "omit"):
+        raise ValueError(
+            f"nan_policy must be 'propagate' or 'omit', got {nan_policy!r}"
+        )
     if stack.shape[-2:] != geometries.shape:
         raise ValueError(
             f"stack raster {stack.shape[-2:]} does not match geometries "
@@ -146,11 +158,16 @@ def aggregate_stack(
     for t in range(n_time):
         for b in range(n_bands):
             values = stack[t, b].ravel()
+            weights = counts
+            if nan_policy == "omit":
+                weights = np.bincount(
+                    flat_labels, weights=~np.isnan(values), minlength=n_nodes
+                )
             column = b * len(statistics)
             cache: dict[str, np.ndarray] = {}
             for offset, stat in enumerate(statistics):
                 out[t, :, column + offset] = _reduce(
-                    values, flat_labels, counts, n_nodes, stat, cache
+                    values, flat_labels, weights, n_nodes, stat, cache, nan_policy
                 )
     return out
 
@@ -162,23 +179,45 @@ def _reduce(
     n_nodes: int,
     statistic: str,
     cache: dict[str, np.ndarray],
+    nan_policy: str = "propagate",
 ) -> np.ndarray:
+    """One statistic of one band, over nodes. ``counts`` is the divisor.
+
+    Under ``nan_policy="omit"`` the caller passes the per-node count of the
+    **valid** samples, and each statistic neutralises the masked ones in the way
+    that leaves it unchanged — zero for a sum, an infinity for an extremum. A
+    node observed nowhere then divides by zero and comes out ``NaN``, which is
+    exactly the marker :func:`gnn_sar.data.features.fill_temporal_gaps` reads.
+    """
     if statistic in cache:
         return cache[statistic]
+    omit = nan_policy == "omit"
+    empty = counts <= 0
+    divisor = np.where(empty, np.nan, counts)
+    masked = np.isnan(values) if omit else None
     if statistic in ("mean", "std"):
-        mean = np.bincount(labels, weights=values, minlength=n_nodes) / counts
+        summable = np.where(masked, 0.0, values) if omit else values
+        mean = np.bincount(labels, weights=summable, minlength=n_nodes) / divisor
         cache["mean"] = mean
         if statistic == "std":
-            sq = np.bincount(labels, weights=values**2, minlength=n_nodes) / counts
+            sq = np.bincount(labels, weights=summable**2, minlength=n_nodes) / divisor
             cache["std"] = np.sqrt(np.maximum(sq - mean**2, 0.0))
     elif statistic == "min":
         reduced = np.full(n_nodes, np.inf)
-        np.minimum.at(reduced, labels, values)
-        cache["min"] = reduced
+        # A NaN reaching this branch is a node that was not observed, and
+        # propagating it is the point; NumPy calls that an invalid operation.
+        with np.errstate(invalid="ignore"):
+            np.minimum.at(
+                reduced, labels, np.where(masked, np.inf, values) if omit else values
+            )
+        cache["min"] = np.where(empty, np.nan, reduced)
     elif statistic == "max":
         reduced = np.full(n_nodes, -np.inf)
-        np.maximum.at(reduced, labels, values)
-        cache["max"] = reduced
+        with np.errstate(invalid="ignore"):
+            np.maximum.at(
+                reduced, labels, np.where(masked, -np.inf, values) if omit else values
+            )
+        cache["max"] = np.where(empty, np.nan, reduced)
     return cache[statistic]
 
 
