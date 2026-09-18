@@ -14,15 +14,26 @@ the Sentinel-1 time series over it, and supervise sub-annual predictions with
 the annual labels that actually exist.
 
 > **Status: a working research scaffold, not a validated product.**
-> Everything here runs end to end and is covered by tests, but only against a
-> **synthetic** scenario. There is no Sentinel-1 ingestion and no ISPRA/SNPA
-> comparison yet — see [What is not here](#what-is-not-here).
+> The pipeline now runs end to end on real data — catalogue search, ingestion of
+> preprocessed Sentinel-1/Sentinel-2 GeoTIFFs, ISPRA/SNPA-style annual labels,
+> training, and georeferenced sub-annual maps — and everything is covered by
+> tests. But every number published here still comes from a **synthetic**
+> scenario: no run against real acquisitions has been validated yet, and the SAR
+> preprocessing itself stays in SNAP. See
+> [Working with real data](#working-with-real-data) and
+> [What is not here](#what-is-not-here).
 
 ## Install
 
 ```bash
-poetry install --with dev          # add --extras segmentation for SLIC
+poetry install --with dev --extras all
 ```
+
+The extras are optional and only concern the data side: `geo` (`rasterio`) reads
+the GeoTIFFs of a real study area and writes the output maps, `download`
+(`requests`) queries the Copernicus catalogue, `segmentation` (`scikit-image`)
+provides SLIC super-pixels. The core — graph, model, losses, metrics — needs
+none of them.
 
 PyTorch is pinned to `2.6.0`. On a machine without a GPU, install the CPU wheel
 first so the CUDA runtime is not pulled in:
@@ -65,6 +76,51 @@ maps["early_warning"]             # (T, N) "seals within the next h composites"
 raster = scenario.geometries.rasterise(maps["sealed_probability"][-1])
 ```
 
+## Working with real data
+
+Three commands take an area from the Copernicus archive to a sub-annual map:
+
+```bash
+# 0. the pilot areas — Roma, Viterbo, Milano — and the grid each one pins
+gnn-sar sites
+
+# 1. what exists over the area, and optionally fetch it (needs CDSE credentials)
+gnn-sar search --collection SENTINEL-1 --site viterbo \
+    --start 2021-01-01 --end 2024-01-01 --product-type IW_GRDH_1S \
+    --orbit 22 --orbit-direction DESCENDING --download data/raw/s1
+
+# 2. raw products -> rasters on the study grid (SNAP for SAR, nothing for L2A)
+gnn-sar preprocess s1 --site viterbo --input data/raw/s1 --output viterbo/s1
+gnn-sar preprocess s2 --site viterbo --input data/raw/s2 --output viterbo/s2
+
+# 3. rasters -> nodes, edges, monthly composites, annual labels, one .npz
+gnn-sar ingest docs/esempi/aree/viterbo.json
+
+# 4. train, and write the sub-annual products back out as GeoTIFFs
+gnn-sar train viterbo/cache/viterbo.npz --model stgnn --output-dir results/
+```
+
+Step 2 is where a time series is made or ruined — calibration, terrain
+correction, speckle filtering, cloud masking, one grid for everything — so the
+SNAP chains are versioned XML you can read and change
+([`docs/esempi/`](docs/esempi)), and the grid is a study area's, not a
+correctly typed `gdalwarp` line.
+
+Three documents, all in Italian:
+
+- **[`docs/guida_dati_sentinel.md`](docs/guida_dati_sentinel.md)** — the full
+  walkthrough: where to register, which product to choose (GRD, RTC, SLC, L2A),
+  the preprocessing, the ingestion config field by field, and the
+  methodological traps — one relative orbit, one grid, segment once, `-1` is
+  not a zero.
+- **[`docs/dati_etichette_ispra.md`](docs/dati_etichette_ispra.md)** — where the
+  annual labels come from, under which licence, and how their pixels are coded.
+  In the ISPRA/SNPA classification `1` is consumed soil and `2` is *not*
+  consumed soil, so "any non-zero means sealed" would label the whole country;
+  the ingestion now refuses to guess.
+- **[`docs/roadmap.md`](docs/roadmap.md)** — what is still missing, in what
+  order, and what each piece costs.
+
 ## The idea in one page
 
 **Nodes are fixed, features move.** Speckle makes a segmentation recomputed at
@@ -101,8 +157,16 @@ composites of the same labelled year does not change the loss at all.
 | Module | What it does |
 | --- | --- |
 | `gnn_sar.config` | Dataclass configs, JSON-serialisable, validated at construction |
+| `gnn_sar.data.cdse` | Copernicus Data Space Ecosystem: catalogue search and download |
+| `gnn_sar.data.sites` | The pilot areas, and the one grid every input of an area must share |
+| `gnn_sar.data.preprocess` | The local ingestor: SNAP for SAR and coherence, band stacking for L2A, alignment for both |
+| `gnn_sar.data.raster` | The only module that knows about a CRS: aligned GeoTIFF in, map out |
+| `gnn_sar.data.sentinel` | Sensing dates, the composite calendar, S1 dB/ratio, S2 indices and cloud mask |
 | `gnn_sar.data.segmentation` | Fixed node geometries: cadastral, regular tiling, or SLIC |
 | `gnn_sar.data.features` | Irregular revisit → regular composites; dB; leakage-safe standardisation |
+| `gnn_sar.data.labels` | Annual sealed **state** → land-take **transitions**; corridor masks |
+| `gnn_sar.data.study_area` | Rasters, dates, geometries and labels assembled into a graph, cached as one `.npz` |
+| `gnn_sar.data.ingest` | The declarative, memory-bounded version of that, driven by a JSON config |
 | `gnn_sar.data.graph` | Adjacency and connectivity edges, causal super-graph, geographic splits |
 | `gnn_sar.data.targets` | Weak (annual) and strong (dated) supervision targets |
 | `gnn_sar.data.synthetic` | A land-take scenario with topological propagation and weak labels |
@@ -110,7 +174,7 @@ composites of the same labelled year does not change the loss at all.
 | `gnn_sar.models.baselines` | The same model minus the graph, minus time, and a random forest |
 | `gnn_sar.losses.weak` | Multiple-instance annual loss, graph smoothness, single-onset |
 | `gnn_sar.metrics` | Detection delay, early-warning lead time, OA/F1/IoU/kappa |
-| `gnn_sar.training` | Lightning datamodule, module and the `gnn-sar` CLI |
+| `gnn_sar.training` | Lightning datamodule, module and the `gnn-sar search/ingest/train/demo` CLI |
 
 ## What the demo actually reports
 
@@ -149,16 +213,26 @@ gnn-sar demo --models stgnn temporal mlp rf --max-epochs 120 \
 
 Named so that nobody mistakes the scaffold for the system:
 
-- **Sentinel-1 ingestion.** No CDSE download, no SNAP graph, no calibration,
-  terrain correction, despeckling or InSAR coherence. `make_synthetic_scenario`
-  stands in for all of it; the pipeline from `(T, B, H, W)` rasters onward is
-  real.
-- **ISPRA/SNPA ground truth.** Not redistributable, and not wired in. The
-  annual-label contract the code expects is `(Y, N)` with `-1` for unknown.
-- **Sentinel-2 fusion.** The feature tensor is source-agnostic, but nothing
-  computes optical features or cloud masks.
-- **Cadastral geometries.** `NodeGeometries.from_label_image` accepts a
-  rasterised parcel layer; rasterising one is left to the user.
+- **A validated run on real acquisitions.** The ingestion is exercised by tests
+  against GeoTIFFs the tests themselves write; every published number still comes
+  from the simulator.
+- **A verified SNAP chain.** `gnn-sar preprocess` orchestrates SNAP — finds
+  `gpt`, resumes a batch, aligns the output, reports failures — and the graphs
+  use standard operators, but neither has been run against a real product here.
+  Check the first two scenes before launching a series. The CDSE RTC products
+  skip SNAP entirely.
+- **A verified coherence chain.** Pair selection and the SLC graph are in
+  (`gnn-sar preprocess coherence`); sub-swath merging, the baseline changing
+  along a long series, and whether coherence belongs on the nodes or on the
+  temporal edges are open — see `docs/roadmap.md`.
+- **ISPRA/SNPA ground truth.** Not redistributable. What is here is the
+  conversion from the annual sealed-state rasters to the land-take transitions
+  the loss expects, `-1` for unknown included.
+- **Cadastral geometries.** `NodeGeometries.from_label_image` and the `labels`
+  segmentation method accept a rasterised parcel layer; rasterising one is left
+  to GDAL.
+- **Neighbour sampling.** Everything is full-batch, so a large area has to be cut
+  into study areas by hand.
 - **The siamese U-Net baseline** of the proposal — it works on rasters, not on
   the node graph, and a fake version would be worse than none.
 - **EO foundation models** (Prithvi/Presto/Clay) as baselines.
@@ -169,10 +243,13 @@ Named so that nobody mistakes the scaffold for the system:
 pytest
 ```
 
-150 tests covering graph-construction invariants, the causality and
+270 tests covering graph-construction invariants, the causality and
 monotonicity guarantees, the behaviour of each loss term, the metrics against
-scikit-learn, and an end-to-end training cycle. One is skipped unless the
-optional `segmentation` extra is installed.
+scikit-learn, the date/label/ingestion accounting, the study-area grids, the preprocessing
+around SNAP, and two end-to-end cycles —
+one on the synthetic scenario, one from GeoTIFFs to a trained model and its
+exported maps. Tests that need an optional extra are skipped without it
+(`segmentation` for SLIC, `geo` for everything that touches a GeoTIFF).
 
 ## Licence
 

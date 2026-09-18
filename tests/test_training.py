@@ -232,3 +232,63 @@ def test_the_demo_runs_every_requested_model_end_to_end(tmp_path):
     for metrics in results.values():
         assert "test/annual_f1" in metrics
         assert "truth/delay_detection_rate" in metrics
+
+
+def test_the_cli_parses_an_ingest_and_a_train_invocation():
+    parser = build_parser()
+
+    ingest = parser.parse_args(["ingest", "config.json"])
+    train = parser.parse_args(["train", "area.npz", "--model", "temporal"])
+
+    assert (ingest.command, ingest.config.name) == ("ingest", "config.json")
+    assert (train.command, train.model) == ("train", "temporal")
+
+
+def test_training_on_an_ingested_area_writes_metrics_and_georeferenced_maps(
+    tmp_path, scenario
+):
+    """`gnn-sar train` on a cached study area, from the .npz to the GeoTIFFs."""
+    pytest.importorskip("rasterio", reason="needs the geo extra")
+    from gnn_sar.data.raster import RasterGrid
+    from gnn_sar.data.sentinel import PeriodGrid
+    from gnn_sar.data.study_area import study_area_from_features
+    from gnn_sar.training.cli import run_training
+
+    graph = scenario.graph
+    area = study_area_from_features(
+        features=graph.features,
+        channel_names=[f"c{i}" for i in range(graph.n_features)],
+        geometries=scenario.geometries,
+        # Twelve monthly composites straddling two calendar years, so the
+        # scenario's two label rows line up with the year index.
+        periods=PeriodGrid.covering(["2022-07-15", "2023-06-15"], "month"),
+        annual_labels=graph.annual_labels,
+        grid=RasterGrid(
+            *scenario.geometries.shape,
+            (300000.0, 10.0, 0.0, 4600000.0, 0.0, -10.0),
+            "EPSG:32633",
+        ),
+    )
+    path = area.save(tmp_path / "area.npz")
+
+    args = build_parser().parse_args(
+        [
+            "train",
+            str(path),
+            "--max-epochs",
+            "2",
+            "--output-dir",
+            str(tmp_path / "run"),
+        ]
+    )
+    metrics = run_training(args)
+
+    assert "test/annual_f1" in metrics
+    written = {file.name for file in (tmp_path / "run").iterdir()}
+    assert {"metrics.json", "stgnn.ckpt", "sealed_probability.tif", "onset.tif"} <= written
+
+    import rasterio
+
+    with rasterio.open(tmp_path / "run" / "sealed_probability.tif") as raster:
+        assert raster.count == graph.n_time  # one band per composite
+        assert raster.crs.to_string() == "EPSG:32633"

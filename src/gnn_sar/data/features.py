@@ -13,12 +13,18 @@ heterogeneity that GLCM contrast would otherwise measure per pixel.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 
-__all__ = ["to_decibel", "composite_by_period", "FeatureStandardizer"]
+__all__ = [
+    "to_decibel",
+    "composite_by_period",
+    "fill_temporal_gaps",
+    "FeatureStandardizer",
+]
 
 _EPS = 1e-10
 
@@ -42,6 +48,7 @@ def composite_by_period(
     n_periods: int | None = None,
     reducer: Literal["median", "mean", "min", "max"] = "median",
     fill: Literal["previous", "nan", "zero"] = "previous",
+    ignore_nan: bool = False,
 ) -> np.ndarray:
     """Reduce irregular acquisitions into a regular sequence of composites.
 
@@ -56,6 +63,13 @@ def composite_by_period(
         fill: what to emit for a period with no acquisition — carry the
             previous composite forward (the default, and what an operational
             chain does), or mark the gap explicitly.
+        ignore_nan: reduce over the valid samples only, element by element.
+            This is what a cloud mask needs: a Sentinel-2 acquisition is
+            usually valid over part of the scene and masked over the rest, so
+            the acquisition must contribute where it is clear instead of being
+            dropped whole. It leaves ``NaN`` wherever *every* sample of a
+            period is masked, which :func:`fill_temporal_gaps` then closes.
+            Sentinel-1 does not need it: SAR sees through cloud.
 
     Returns:
         ``(n_periods, ...)`` array of composites.
@@ -78,17 +92,26 @@ def composite_by_period(
             f"n_periods={n_periods} cannot hold period index {int(period_index.max())}"
         )
 
-    reduce = {
-        "median": np.median,
-        "mean": np.mean,
-        "min": np.min,
-        "max": np.max,
-    }[reducer]
+    reducers = {
+        "median": (np.median, np.nanmedian),
+        "mean": (np.mean, np.nanmean),
+        "min": (np.min, np.nanmin),
+        "max": (np.max, np.nanmax),
+    }
+    reduce = reducers[reducer][1 if ignore_nan else 0]
 
     out = np.full((n_periods, *acquisitions.shape[1:]), np.nan, dtype=np.float64)
     for period in range(n_periods):
         members = acquisitions[period_index == period]
-        if members.shape[0]:
+        if not members.shape[0]:
+            continue
+        if ignore_nan:
+            # A pixel masked in every acquisition of the period is a legitimate
+            # outcome (a month of unbroken cloud), not something to warn about.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                out[period] = reduce(members, axis=0)
+        else:
             out[period] = reduce(members, axis=0)
 
     empty = np.isnan(out.reshape(n_periods, -1)).all(axis=1)
@@ -110,6 +133,40 @@ def composite_by_period(
             continue
         out[period] = out[period - 1] if period > first else out[first]
     return out
+
+
+def fill_temporal_gaps(composites: np.ndarray) -> np.ndarray:
+    """Close residual ``NaN`` gaps along the time axis, element by element.
+
+    :func:`composite_by_period` fills a period in which *nothing* was acquired,
+    but with ``ignore_nan`` a period can still hold masked pixels — a patch of
+    cloud that never cleared inside the month. Those are carried forward from
+    the last valid composite of that same pixel, and a leading gap is back-filled
+    from the first valid one, which is what keeps the feature tensor finite
+    without inventing a change.
+
+    A pixel that is masked in *every* composite has nothing to carry: it stays
+    ``NaN``, deliberately, so the caller decides whether to drop it. Sentinel-1
+    features never reach this function with gaps.
+
+    Args:
+        composites: ``(T, ...)`` array, time first.
+
+    Returns:
+        An array of the same shape, filled in place-safe fashion (a copy).
+    """
+    composites = np.array(composites, dtype=np.float64, copy=True)
+    if composites.ndim < 1 or composites.shape[0] == 0:
+        raise ValueError("composites must have a non-empty leading time axis")
+
+    n_time = composites.shape[0]
+    for t in range(1, n_time):  # forward fill
+        gap = np.isnan(composites[t])
+        composites[t][gap] = composites[t - 1][gap]
+    for t in range(n_time - 2, -1, -1):  # back-fill the leading gap
+        gap = np.isnan(composites[t])
+        composites[t][gap] = composites[t + 1][gap]
+    return composites
 
 
 @dataclass

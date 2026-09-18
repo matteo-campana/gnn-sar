@@ -1,0 +1,82 @@
+{
+  "//": "Milano sud e hinterland (Pianura Padana). L'ottico e' inutilizzabile per mesi interi: e' il caso che giustifica l'impianto SAR-first.",
+  "site": "milano",
+  "sources": [
+    {
+      "//": "GeoTIFF prodotti da `gnn-sar preprocess s1 --site milano` (SNAP) oppure RTC riallineati. Potenza lineare, VV+VH.",
+      "name": "s1",
+      "kind": "sentinel1",
+      "directory": "s1",
+      "pattern": "*.tif",
+      "bands": {
+        "VV": 1,
+        "VH": 2
+      },
+      "linear": true,
+      "ratio": true,
+      "reducer": "median"
+    },
+    {
+      "//": "GeoTIFF prodotti da `gnn-sar preprocess s2 --site milano`: 6 bande + SCL, gia' a 10 m.",
+      "name": "s2",
+      "kind": "sentinel2",
+      "directory": "s2",
+      "pattern": "*.tif",
+      "bands": {
+        "B02": 1,
+        "B03": 2,
+        "B04": 3,
+        "B08": 4,
+        "B11": 5,
+        "B12": 6
+      },
+      "scl_band": 7,
+      "scale": 0.0001,
+      "indices": [
+        "ndvi",
+        "ndbi"
+      ],
+      "reducer": "median"
+    }
+  ],
+  "segmentation": {
+    "//": "SLIC su composito multitemporale. 20600 nodi = ~256 pixel per nodo, cioe' unita' di ~160 m: e' il compromesso per una prima corsa full-batch. Per arrivare a ~80 m (la scala di un lotto) moltiplicare n_segments per 4 e aspettarsi 4x memoria e tempo nel modello.",
+    "method": "slic",
+    "n_segments": 20600,
+    "compactness": 8.0,
+    "composites": 8
+  },
+  "period": "month",
+  "statistics": [
+    "mean",
+    "std"
+  ],
+  "labels": {
+    "//": "Cartografia ISPRA/SNPA dello STATO sigillato, un raster per anno, gia' sulla griglia del sito. sealed_values NON e' opzionale con la codifica ISPRA (1 = consumato, 2 = NON consumato): vedi docs/dati_etichette_ispra.md",
+    "rasters": {
+      "2020": "labels/consumo_suolo_2020.tif",
+      "2021": "labels/consumo_suolo_2021.tif",
+      "2022": "labels/consumo_suolo_2022.tif",
+      "2023": "labels/consumo_suolo_2023.tif"
+    },
+    "band": 1,
+    "sealed_values": [
+      1
+    ],
+    "threshold": 0.5,
+    "min_coverage": 0.5,
+    "pre_existing": "ignore"
+  },
+  "corridor": {
+    "//": "Rete stradale OSM bufferizzata e rasterizzata sulla griglia del sito.",
+    "raster": "osm/strade_buffer50m.tif",
+    "min_fraction": 0.0
+  },
+  "graph": {
+    "n_neighbors": 4,
+    "connectivity_radius": 40.0,
+    "temporal_order": 1,
+    "//": "connectivity_radius e' in PIXEL (i centroidi sono in coordinate raster): 40 px = 400 m a 10 m di pixel."
+  },
+  "output": "cache/milano.npz"
+}
