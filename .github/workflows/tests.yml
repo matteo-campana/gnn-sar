@@ -26,10 +26,16 @@ jobs:
 
       - name: Install the project and its development dependencies
         # rasterio brings the geo extra, so the GeoTIFF ingestion tests run
-        # instead of being skipped.
+        # instead of being skipped. MLflow is a core dependency, so `pip install
+        # -e .` brings it in and the tracking tests run against a temporary file
+        # store rather than being skipped.
         run: |
           pip install -e .
           pip install pytest scikit-learn networkx rasterio
 
       - name: Run the test suite
+        env:
+          # Runs go to a per-test temporary store (see tests/conftest.py); this
+          # only keeps MLflow's assistant hint out of the log.
+          MLFLOW_DISABLE_AGENT_HINT: "1"
         run: pytest

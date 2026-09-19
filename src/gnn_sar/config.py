@@ -15,9 +15,26 @@ from typing import Any, Literal, get_type_hints
 __all__ = [
     "GraphConfig",
     "ModelConfig",
+    "LossConfig",
     "TrainingConfig",
+    "TrackingConfig",
     "ExperimentConfig",
 ]
+
+PRECISIONS = (
+    "32-true",
+    "64-true",
+    "16-mixed",
+    "bf16-mixed",
+    "16-true",
+    "bf16-true",
+)
+"""The Lightning precision settings this project supports.
+
+The mixed ones are the reason a GPU run is worth it: ``bf16-mixed`` on any
+Ampere or newer card roughly halves the memory a study area's feature tensor
+occupies, which is what decides whether a whole province fits at once.
+"""
 
 
 @dataclass(frozen=True)
@@ -122,7 +139,14 @@ class LossConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    """Phase 4/5 — optimisation and evaluation protocol."""
+    """Phase 4/5 — optimisation, hardware and evaluation protocol.
+
+    The hardware settings are deliberately thin: ``accelerator="auto"`` with
+    ``devices=1`` picks up a CUDA card, Apple's MPS or the CPU without the
+    caller doing anything. A study area is **one** full-batch graph, so more
+    than one device would replicate the same graph rather than split it; the
+    lever that actually buys headroom is ``precision``.
+    """
 
     max_epochs: int = 50
     learning_rate: float = 1e-3
@@ -130,10 +154,57 @@ class TrainingConfig:
     seed: int = 42
     accelerator: str = "auto"
     devices: int | str = 1
+    precision: str = "32-true"
+    """Lightning precision; see :data:`PRECISIONS`. Mixed precision is ignored
+    on CPU by Lightning itself, so the default config stays portable."""
+    matmul_precision: Literal["highest", "high", "medium"] = "high"
+    """Tensor-core policy for float32 matmuls (``torch.set_float32_matmul_precision``)."""
     gradient_clip_val: float = 1.0
     decision_threshold: float = 0.5
     log_every_n_steps: int = 1
+    deterministic: bool = False
+    """Ask cuDNN for reproducible kernels. Slower, and some scatter operations
+    torch-geometric relies on have no deterministic implementation, so this is
+    off by default and ``warn`` rather than ``True`` is used when enabled."""
     loss: LossConfig = field(default_factory=LossConfig)
+
+    def __post_init__(self) -> None:
+        if self.max_epochs < 1:
+            raise ValueError("max_epochs must be >= 1")
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be > 0")
+        if self.precision not in PRECISIONS:
+            raise ValueError(
+                f"precision must be one of {list(PRECISIONS)}, got {self.precision!r}"
+            )
+        if not 0.0 <= self.decision_threshold <= 1.0:
+            raise ValueError("decision_threshold must be in [0, 1]")
+
+
+@dataclass(frozen=True)
+class TrackingConfig:
+    """Where a run is recorded — MLflow, for every experiment in the project.
+
+    Attributes:
+        enabled: Turn tracking off entirely (``--no-tracking``). A run then
+            produces its metrics on stdout and nothing on disk.
+        experiment_name: MLflow experiment the runs are grouped under.
+        tracking_uri: ``None`` falls back to ``MLFLOW_TRACKING_URI`` and then to
+            a local ``./mlruns`` file store, so ``mlflow ui`` works with no
+            setup; point it at a server to share the runs.
+        run_name: Name of the run. ``None`` lets MLflow generate one, except in
+            the demo, where the model being compared is the natural name.
+        log_checkpoints: Attach the trained weights to the run.
+        log_maps: Attach the exported sub-annual GeoTIFFs to the run. They are
+            the actual product, but also the bulkiest artefact.
+    """
+
+    enabled: bool = True
+    experiment_name: str = "gnn-sar"
+    tracking_uri: str | None = None
+    run_name: str | None = None
+    log_checkpoints: bool = True
+    log_maps: bool = True
 
 
 @dataclass(frozen=True)
@@ -143,6 +214,7 @@ class ExperimentConfig:
     graph: GraphConfig = field(default_factory=GraphConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    tracking: TrackingConfig = field(default_factory=TrackingConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

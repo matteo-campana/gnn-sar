@@ -12,16 +12,11 @@ from typing import Any
 
 import numpy as np
 
+from gnn_sar.metrics._convert import to_numpy
+
 __all__ = ["onset_from_probability", "detection_delay", "early_warning_lead_time"]
 
 NEVER = -1
-
-
-def _to_numpy(values: Any) -> np.ndarray:
-    detach = getattr(values, "detach", None)
-    if detach is not None:  # torch tensor
-        values = detach().cpu().numpy()
-    return np.asarray(values)
 
 
 def onset_from_probability(
@@ -37,7 +32,7 @@ def onset_from_probability(
             robustness to a single noisy composite, which is the trade-off an
             operational chain has to make explicitly.
     """
-    probability = _to_numpy(probability)
+    probability = to_numpy(probability)
     if probability.ndim != 2:
         raise ValueError(f"probability must be (T, N), got {probability.shape}")
     if min_persistence < 1:
@@ -78,8 +73,8 @@ def detection_delay(
         negative = early), plus ``detection_rate``, ``false_alarm_rate``,
         ``n_evaluated`` and ``n_missed``.
     """
-    predicted = _to_numpy(predicted_onset).astype(np.int64).ravel()
-    truth = _to_numpy(true_onset).astype(np.int64).ravel()
+    predicted = to_numpy(predicted_onset).astype(np.int64).ravel()
+    truth = to_numpy(true_onset).astype(np.int64).ravel()
     if predicted.shape != truth.shape:
         raise ValueError(
             f"predicted_onset {predicted.shape} and true_onset {truth.shape} differ"
@@ -122,8 +117,8 @@ def early_warning_lead_time(
         ``alarm_rate`` (share of sealed nodes warned in advance) and
         ``false_alarm_rate`` over nodes that never sealed.
     """
-    probability = _to_numpy(horizon_probability)
-    truth = _to_numpy(true_onset).astype(np.int64).ravel()
+    probability = to_numpy(horizon_probability)
+    truth = to_numpy(true_onset).astype(np.int64).ravel()
     if probability.ndim != 2:
         raise ValueError(f"horizon_probability must be (T, N), got {probability.shape}")
     if probability.shape[1] != truth.shape[0]:

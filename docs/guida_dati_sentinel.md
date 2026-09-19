@@ -84,6 +84,9 @@ Su una macchina senza GPU conviene installare prima la wheel CPU di PyTorch, che
 pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
 ```
 
+MLflow è una dipendenza **core**, non un extra: ogni run viene registrato, e il
+posto dove un risultato vive è il suo run, non il nome di una cartella.
+
 Gli *extras* sono opzionali e servono solo alla parte dati:
 
 | extra | pacchetto | serve per |
@@ -682,6 +685,37 @@ gnn-sar train viterbo/cache/viterbo.npz \
     --max-epochs 200 \
     --output-dir risultati/viterbo_stgnn
 ```
+
+**GPU.** Non serve nessun flag: il default è `--accelerator auto --devices 1`,
+che prende la GPU quando c'è. Su una scheda Ampere o più recente conviene
+aggiungere `--precision bf16-mixed`, che dimezza circa la memoria occupata dal
+tensore delle feature — ed è quello che decide se un'intera provincia ci sta in
+una volta. Un'area di studio è **un solo grafo full-batch**, quindi `--devices 2`
+lo replicherebbe invece di dividerlo: la leva utile è la precisione, non il
+numero di schede.
+
+```bash
+gnn-sar train viterbo/cache/viterbo.npz --output-dir risultati/viterbo_stgnn \
+    --accelerator gpu --precision bf16-mixed --experiment-name viterbo
+```
+
+**MLflow.** Ogni run è registrato: i parametri sono l'intero
+`ExperimentConfig` (nomi puntati, `training.loss.positive_weight`), le metriche
+sono quelle che il loop Lightning logga epoca per epoca, e gli artefatti sono
+`config.json`, `metrics.json`, il checkpoint e i GeoTIFF sub-annuali. Senza
+configurare niente i run finiscono in `./mlruns`, che `mlflow ui` legge così
+com'è:
+
+```bash
+mlflow ui        # http://127.0.0.1:5000
+```
+
+Per scrivere altrove: `--tracking-uri` (o `MLFLOW_TRACKING_URI`) accetta un
+server, `sqlite:///mlflow.db`, Databricks. `--experiment-name` e `--run-name`
+decidono come il run è archiviato, `--no-tracking` non registra nulla. Con
+`gnn-sar demo` si apre **un run per modello confrontato**, con il nome del
+modello come tag: il confronto dell'OS3 diventa un filtro nell'interfaccia
+invece del diff di due log.
 
 Scrive nella cartella indicata:
 

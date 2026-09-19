@@ -16,6 +16,12 @@ outputs/
 lightning_logs/
 *.ckpt
 
+# MLflow: the default tracking URI is a ./mlruns file store in the working
+# directory, so a local run must not end up in a commit.
+mlruns/
+mlartifacts/
+mlflow.db
+
 # OS / editor
 .DS_Store
 .vscode/
