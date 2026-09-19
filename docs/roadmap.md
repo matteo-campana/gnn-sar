@@ -31,6 +31,13 @@ Cosa serve, nell'ordine:
 6. `gnn-sar ingest docs/esempi/aree/viterbo.json`;
 7. `gnn-sar train … --model stgnn` e le ablazioni `temporal`, `mlp`, `rf`.
 
+Gli iperparametri di quella corsa non vanno indovinati: obiettivo, ottimizzatore
+e schedule si scelgono per nome e `gnn-sar sweep` esegue la griglia in run
+MLflow separati (→ guida, §10.1–10.2). Con poche centinaia di transizioni per
+anno la varianza fra seed è alta, quindi vale la pena spendere i run su più semi
+piuttosto che su una griglia più fitta — e ordinare per `val/annual_f1`, citando
+il `test/` del solo run scelto.
+
 Viterbo è il candidato migliore per primo: area meno costruita di Roma (quindi
 più nodi utili e non esclusi come preesistenti), fenomeno netto e documentato
 (fotovoltaico a terra), e Sentinel-2 utilizzabile più spesso che a Milano.

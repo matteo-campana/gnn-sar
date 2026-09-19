@@ -35,9 +35,11 @@ Questa guida copre tre cose, nell'ordine in cui servono:
 5. [Dove scaricarli: Copernicus Data Space Ecosystem](#5-dove-scaricarli-copernicus-data-space-ecosystem)
 6. [Pre-processing Sentinel-1](#6-pre-processing-sentinel-1)
 7. [Pre-processing Sentinel-2](#7-pre-processing-sentinel-2)
-8. [Etichette ISPRA/SNPA e corridoi infrastrutturali](#8-etichette-ispra-snpa-e-corridoi-infrastrutturali)
+8. [Etichette ISPRA/SNPA e corridoi infrastrutturali](#8-etichette-isprasnpa-e-corridoi-infrastrutturali)
 9. [Integrazione nel progetto: `gnn-sar ingest`](#9-integrazione-nel-progetto-gnn-sar-ingest)
 10. [Addestramento e mappe: `gnn-sar train`](#10-addestramento-e-mappe-gnn-sar-train)
+    - [10.1 Obiettivo, ottimizzatore e schedule](#101-obiettivo-ottimizzatore-e-schedule)
+    - [10.2 Sweep di parametri](#102-sweep-di-parametri)
 11. [La stessa cosa dall'API Python](#11-la-stessa-cosa-dallapi-python)
 12. [Scelte metodologiche da non sbagliare](#12-scelte-metodologiche-da-non-sbagliare)
 13. [Che cosa manca ancora](#13-che-cosa-manca-ancora)
@@ -153,13 +155,39 @@ maps["early_warning"]         # (T, N) "si sigilla entro h compositi"
 ```
 
 Ogni run è descritto da un `ExperimentConfig` serializzabile in JSON
-(`gnn_sar.config`): grafo, modello, ottimizzazione e pesi della loss. Salvalo
+(`gnn_sar.config`): grafo, modello, ottimizzazione e obiettivo. Salvalo
 insieme ai risultati — è l'unico modo per riprodurli.
 
 ```python
 from gnn_sar.config import ExperimentConfig
 ExperimentConfig().to_json("esperimenti/base.json")
 ```
+
+Dentro `training` ci sono tre sezioni che decidono *come* si addestra, e sono
+quelle che un esperimento cambia davvero:
+
+```json
+{
+  "training": {
+    "max_epochs": 200,
+    "optimizer": {"name": "adamw", "learning_rate": 0.001, "weight_decay": 0.0001,
+                  "params": {}},
+    "scheduler": {"name": "none", "warmup_epochs": 0, "monitor": "val/total"},
+    "loss": {"aggregation": "noisy_or", "smoothness_weight": 0.05,
+             "sparsity_weight": 0.05, "supervised_weight": 1.0,
+             "horizon_weight": 0.5, "terms": []}
+  }
+}
+```
+
+Nessuno dei tre nomi è cablato nel codice: `optimizer.name` e `scheduler.name`
+pescano da un registro in `gnn_sar.training.optim`, `loss.aggregation` da uno in
+`gnn_sar.losses.aggregation`, e `loss.terms` — quando non è vuoto — sostituisce
+i pesi qui sopra con una lista esplicita di termini presi da
+`gnn_sar.losses.registry`. Aggiungere una voce a uno qualsiasi dei registri è
+una funzione decorata, non una modifica al loop di addestramento;
+[`../ARCHITECTURE.md`](../ARCHITECTURE.md) §6 e §6b elencano quello che c'è e
+come si estende.
 
 ## 4. Quali dati servono
 
@@ -700,8 +728,11 @@ gnn-sar train viterbo/cache/viterbo.npz --output-dir risultati/viterbo_stgnn \
 ```
 
 **MLflow.** Ogni run è registrato: i parametri sono l'intero
-`ExperimentConfig` (nomi puntati, `training.loss.positive_weight`), le metriche
-sono quelle che il loop Lightning logga epoca per epoca, e gli artefatti sono
+`ExperimentConfig` (nomi puntati, `training.loss.positive_weight`,
+`training.optimizer.params.momentum`, e un termine dell'obiettivo alla volta
+come `training.loss.terms.1.weight`), le metriche sono quelle che il loop
+Lightning logga epoca per epoca — ogni termine della loss separatamente, più
+il learning rate effettivo quando c'è uno schedule — e gli artefatti sono
 `config.json`, `metrics.json`, il checkpoint e i GeoTIFF sub-annuali. Senza
 configurare niente i run finiscono in `./mlruns`, che `mlflow ui` legge così
 com'è:
@@ -749,6 +780,104 @@ L'ordine delle bande dei file multi-composito è stampato a fine run
   classica. Il guadagno del grafo è la differenza fra `stgnn` e `temporal`, ed è
   esattamente la domanda dell'OS3. Sul simulatore, oggi, quel guadagno è
   negativo: è il motivo per cui servono i dati veri.
+
+### 10.1 Obiettivo, ottimizzatore e schedule
+
+I tre si scelgono per nome, dalla riga di comando o dal file di configurazione.
+`train` e `demo` condividono gli stessi flag:
+
+| flag | che cosa sceglie |
+| --- | --- |
+| `--optimizer` | `adamw` (default), `adam`, `sgd`, `rmsprop`, `adagrad`, `nadam` |
+| `--learning-rate` | il passo da cui l'ottimizzatore parte |
+| `--scheduler` | `none` (default), `cosine`, `cosine_warm_restarts`, `step`, `multistep`, `exponential`, `linear`, `onecycle`, `plateau` |
+| `--loss-aggregation` | `noisy_or` (default), `logsumexp`, `max` — come i compositi di un anno diventano la singola decisione che l'etichetta annuale supervisiona |
+| `--set CHIAVE=VALORE` | **qualunque** campo della configurazione, per nome puntato; ripetibile, il valore è letto come JSON |
+
+```bash
+gnn-sar train viterbo/cache/viterbo.npz --output-dir risultati/viterbo_sgd \
+    --optimizer sgd --learning-rate 0.01 --scheduler cosine \
+    --set training.optimizer.params.momentum=0.9 \
+    --set training.scheduler.warmup_epochs=10 \
+    --set training.loss.smoothness_weight=0.2
+```
+
+L'ordine di precedenza è: i default, poi `--config`, poi i flag tipizzati, e
+infine `--set`, che ha l'ultima parola perché è quello che arriva ovunque.
+Ogni nome è risolto **prima** del primo fit: un `--scheduler cosinus` costa un
+secondo all'avvio, non un'epoca di addestramento.
+
+**Una cosa da sapere sugli schedule.** Un'area di studio è un solo grafo
+full-batch, quindi c'è **esattamente uno step di ottimizzazione per epoca**: uno
+schedule copre `--max-epochs` e non c'è niente da calcolare a mano, ma pesa
+molto più che in un addestramento con migliaia di step. `plateau` sorveglia una
+metrica qualsiasi fra quelle che il run logga (`--set
+training.scheduler.monitor=val/annual_f1`, oppure un singolo termine come
+`val/smoothness`); il nome è verificato contro quelle che il modulo produce
+davvero, quindi un refuso non si scopre alla prima epoca di validazione.
+
+**L'obiettivo è una lista di termini.** Con `training.loss.terms` un run può
+ripesare un termine, dargli iperparametri diversi, toglierlo, o aggiungerne uno
+che la proposta non nomina:
+
+```bash
+gnn-sar train viterbo/cache/viterbo.npz --set 'training.loss.terms=[
+  {"name": "weak_annual", "params": {"objective": "focal", "focal_gamma": 2.0}},
+  {"name": "smoothness", "weight": 0.2, "params": {"power": 1}},
+  {"name": "sparsity", "weight": 0.05, "params": {"max_onsets": 2}}]'
+```
+
+Un termine per cui il run non porta dati si spegne da solo — è così che
+`supervised` e `horizon` spariscono nel regime debole, che è quello normale con
+le sole etichette ISPRA. Un termine a peso zero non viene calcolato ma **resta
+loggato a zero**, così due run mantengono le stesse colonne in MLflow e restano
+confrontabili.
+
+### 10.2 Sweep di parametri
+
+`gnn-sar sweep` esegue una invocazione di `train` (o di `demo`) per ogni punto
+di una griglia sulle stesse chiavi puntate, ognuna come run MLflow separato:
+
+```json
+{
+  "command": "train",
+  "argv": ["viterbo/cache/viterbo.npz", "--model", "stgnn",
+           "--output-dir", "risultati/sweep"],
+  "base": {"training": {"max_epochs": 200}},
+  "grid": {
+    "training.optimizer.learning_rate": [0.003, 0.001, 0.0003],
+    "training.scheduler.name": ["none", "cosine"],
+    "training.loss.smoothness_weight": [0.0, 0.05, 0.2]
+  },
+  "seeds": [0, 1, 2],
+  "strategy": "grid"
+}
+```
+
+```bash
+gnn-sar sweep esperimenti/sweep.json --dry-run       # elenca e valida i 54 run
+gnn-sar sweep esperimenti/sweep.json --output risultati/sweep.json
+```
+
+`argv` sono gli argomenti del comando esattamente come li scriveresti a mano,
+posizionali compresi — per `train` il primo è il percorso dell'area ingerita.
+La griglia viene espansa, e ogni punto validato, **prima** del primo fit: una
+combinazione che nessuna configurazione può esprimere fallisce in un secondo
+invece che dopo una notte. Un punto che solleva un errore viene riportato e lo
+sweep prosegue.
+
+`"strategy": "random"` estrae `n_samples` combinazioni invece del prodotto
+completo, in modo riproducibile (`seed` è quello del campionatore); `max_runs`
+mette comunque un tetto. `docs/esempi/sweep.json` è un file funzionante.
+
+Siccome i valori variati fanno parte della configurazione che ogni run già
+registra, uno sweep si legge nell'interfaccia MLflow come un filtro sui
+parametri che ha variato — non serve altra contabilità.
+
+> **I seed contano.** Uno sweep a un solo seed misura insieme le impostazioni e
+> l'inizializzazione, ed è il modo consueto di scambiare il rumore per un
+> effetto. Con poche centinaia di nodi positivi per anno, come nelle aree
+> pilota, la varianza fra seed è tutt'altro che trascurabile.
 
 ## 11. La stessa cosa dall'API Python
 
@@ -806,6 +935,47 @@ Pezzi utili da conoscere:
 piccole e per i test, mentre per un'area vera conviene `gnn-sar ingest`, che
 lavora un composito alla volta.
 
+### 11.1 Un obiettivo o un ottimizzatore che non c'è ancora
+
+Registri e configurazione coprono il caso in cui la cosa che vuoi provare
+esiste già. Quando non esiste, la si aggiunge da fuori del pacchetto: una
+funzione decorata, e da quel momento è un nome come gli altri.
+
+```python
+from torch import nn
+from gnn_sar import register_term, register_optimizer, build_loss
+from gnn_sar.losses.registry import LossContext
+
+@register_term("confidence")                 # un termine nuovo
+class Confidence(nn.Module):
+    """Penalizza l'incertezza: spinge q_t lontano da 0.5."""
+    def __init__(self, strength: float = 1.0) -> None:
+        super().__init__()
+        self.strength = strength
+
+    def forward(self, ctx: LossContext):
+        q = ctx.output.onset_probability[:, ctx.node_mask]
+        return self.strength * (q * (1 - q)).mean()
+
+@register_optimizer("lion")                  # un ottimizzatore nuovo
+def _lion(params, *, lr, weight_decay, **extra):
+    from lion_pytorch import Lion
+    return Lion(params, lr=lr, weight_decay=weight_decay, **extra)
+```
+
+Un termine riceve un solo `LossContext` — output del modello, indice degli anni,
+etichette, maschera dei nodi, archi, ed etichette esatte se esistono — e
+restituisce uno scalare, oppure `None` se questo run non porta i dati che gli
+servono. È il motivo per cui aggiungere un termine non cambia la firma contro
+cui tutti gli altri sono scritti.
+
+Da lì in poi `{"name": "confidence", "weight": 0.1, "params": {"strength": 2.0}}`
+in `training.loss.terms`, o `--optimizer lion`, funzionano come qualsiasi altra
+voce — sweep e tracciamento MLflow compresi. Per un obiettivo che non si lascia
+descrivere da una lista di termini, `SoilSealingModule(criterion=...)` accetta
+direttamente un modulo scritto a mano, e `build_loss(config)` è quello che il
+modulo costruirebbe da solo.
+
 ## 12. Scelte metodologiche da non sbagliare
 
 1. **Una sola orbita relativa, una sola direzione di passaggio.** Vedi 5.3.
@@ -833,6 +1003,18 @@ lavora un composito alla volta.
    richiederà il *neighbour sampling* per cui GraphSAGE è nato — il modello è
    induttivo, quindi è un'aggiunta al data loader, non un cambio di architettura.
    Nel frattempo, spezza il territorio in aree di studio.
+10. **La regola di aggregazione è una, non due.** `loss.aggregation` decide sia
+    come l'etichetta annuale supervisiona i compositi, sia come le metriche
+    annuali li aggregano per misurare: le due cose passano per la stessa
+    funzione, così non possono divergere senza che nessuno se ne accorga.
+    Separarle è un'ablazione legittima — misurare un modello con una regola
+    diversa da quella con cui è stato addestrato — ma va chiesta esplicitamente
+    con `loss.metric_aggregation`, mai subita.
+11. **Fai il tuning su validation, riporta su test.** Uno sweep sceglie fra
+    decine di configurazioni: se il criterio di scelta è la metrica di test,
+    quel numero non è più una stima onesta di generalizzazione ma il massimo di
+    una distribuzione. Ordina i run per `val/annual_f1` e cita il `test/` del
+    solo run scelto.
 
 ## 13. Che cosa manca ancora
 
