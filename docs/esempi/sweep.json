@@ -1,0 +1,21 @@
+{
+  "command": "demo",
+  "argv": ["--models", "stgnn", "--contrast", "0.3", "--accelerator", "auto"],
+  "base": {
+    "training": {
+      "max_epochs": 50,
+      "scheduler": {"warmup_epochs": 5}
+    }
+  },
+  "grid": {
+    "training.optimizer.name": ["adamw", "sgd"],
+    "training.optimizer.learning_rate": [0.003, 0.001, 0.0003],
+    "training.scheduler.name": ["none", "cosine"],
+    "training.loss.smoothness_weight": [0.0, 0.05, 0.2]
+  },
+  "seeds": [0, 1, 2],
+  "strategy": "random",
+  "n_samples": 12,
+  "seed": 0,
+  "max_runs": 36
+}

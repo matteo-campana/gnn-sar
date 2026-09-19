@@ -211,21 +211,89 @@ together with its gradient.
 
 ### 6. The loss, term by term
 
-`WeakTemporalSupervisionLoss` returns a dict — `total` plus every component — so
-each one is logged separately and can be read during training.
+The objective is a **composition of registered terms**, not a fixed formula.
+`CompositeLoss` owns only what they share — the shape checks, the node mask, the
+weighted sum — and returns a dict, `total` plus every term, so each one is
+logged separately and can be read during training.
+`WeakTemporalSupervisionLoss` is the composition the proposal describes, and
+what a config that names no terms explicitly still builds.
 
-| Term | What it does | Default weight |
-| --- | --- | --- |
-| `weak_annual` | MIL cross-entropy: one bag per (node, year) | 1.0 |
-| `smoothness` | Dirichlet energy of `q_t` over the spatial edges — the diffusion from certain to uncertain areas | 0.05 |
-| `sparsity` | `relu(Σ_t q_t − 1)`: at most one onset per node over the series | 0.05 |
-| `supervised` | Plain BCE on `p_t` where the exact date is known | 1.0 |
-| `horizon` | BCE for the early-warning head | 0.5 |
+| Term | What it does | Default weight | Its own parameters |
+| --- | --- | --- | --- |
+| `weak_annual` | MIL cross-entropy: one bag per (node, year) | 1.0 | `aggregation`, `temperature`, `positive_weight`, `objective` (`bce`/`focal`), `focal_gamma` |
+| `smoothness` | Dirichlet energy of `q_t` over the spatial edges — the diffusion from certain to uncertain areas | 0.05 | `target` (`onset`/`sealed`), `power` |
+| `sparsity` | `relu(Σ_t q_t − max_onsets)`: at most one onset per node over the series | 0.05 | `max_onsets` |
+| `supervised` | Plain BCE on `p_t` where the exact date is known | 1.0 | — |
+| `horizon` | BCE for the early-warning head | 0.5 | `positive_weight` |
 
 `-1` means unknown everywhere and is skipped, never treated as a negative: a
 node whose year is unlabelled is not a node where nothing happened. The
 `weak_annual` term weights each year by how many labelled nodes it contributes,
 so a year with sparse labels does not count as much as a full one.
+
+A term returns `None` when the run carries no data for it, which is how
+`supervised` and `horizon` switch themselves off in the weak regime. A term at
+weight zero is skipped but **still logged at zero**, so two runs keep the same
+columns in MLflow and stay comparable.
+
+An experiment states the objective as a list, and can then add a term the
+proposal never mentioned or drop one it does:
+
+```json
+{"training": {"loss": {"terms": [
+  {"name": "weak_annual", "params": {"objective": "focal", "focal_gamma": 2.0}},
+  {"name": "smoothness", "weight": 0.2, "params": {"power": 1}},
+  {"name": "sparsity", "weight": 0.05, "params": {"max_onsets": 2}}
+]}}}
+```
+
+A new term is a `nn.Module` taking one `LossContext` and returning one scalar,
+registered with `@register_term("name")`. Passing the context rather than eight
+arguments is what keeps a new term from changing the signature every other term
+is written against.
+
+`aggregate_year_logit` — the rule that collapses a year's composites into the
+one decision an annual label can supervise — lives in `losses/aggregation.py`
+with its own registry, because **two** callers need exactly the same rule: the
+`weak_annual` term and the annual metrics. `LossConfig.metric_aggregation` is
+how they are separated on purpose, for the ablation that measures a model under
+a rule it was not trained under; left unset, they cannot drift apart.
+
+### 6b. The optimiser and the schedule
+
+Same idea, two more registries, in `training/optim.py`. `configure_optimizers`
+builds both from the config and returns the bare optimiser when there is no
+schedule — which is the default, and what every run before the registries did.
+
+| Registry | Entries |
+| --- | --- |
+| `OPTIMIZERS` | `adamw` (default), `adam`, `sgd`, `rmsprop`, `adagrad`, `nadam` |
+| `SCHEDULERS` | `none` (default), `cosine`, `cosine_warm_restarts`, `step`, `multistep`, `exponential`, `linear`, `onecycle`, `plateau` |
+| `AGGREGATIONS` | `noisy_or` (default), `logsumexp`, `max` |
+| `LOSS_TERMS` | the five above, plus whatever is registered |
+
+An optimiser's own arguments (`betas`, `momentum`, `nesterov`) go in
+`optimizer.params` and are handed to its constructor untouched, so the registry
+gains an entry without `OptimizerConfig` changing.
+`optimizer.decay_on_norm_and_bias: false` splits the parameters into two groups
+and exempts biases and normalisation scales from the decay.
+
+One property of this project decides how the schedules behave: **a study area is
+one full-batch graph, so there is exactly one optimiser step per epoch**.
+`interval` is a formality, the total step count is known before the run starts
+(`max_epochs` — which is why `cosine` and `onecycle` need nothing computed by
+the caller), and a schedule over fifty steps is a first-order hyper-parameter
+rather than a refinement. `scheduler.warmup_epochs` prepends a linear warm-up to
+any schedule except `plateau`, which reacts to a metric rather than to the epoch
+count and so cannot be chained.
+
+`plateau` watches `scheduler.monitor`, any metric the module logs — `val/total`,
+`val/annual_f1`, or a single loss term such as `val/smoothness`. The name is
+checked against `SoilSealingModule.logged_metric_names()` when the optimiser is
+built, so a typo costs a second at start-up rather than an epoch of fitting.
+
+Every name a config selects is resolved before the first fit, for the same
+reason: it is what makes an unattended sweep worth launching.
 
 ### 7. Splits are geographic, not random
 
@@ -314,6 +382,12 @@ otherwise open a second store without saying so.
 | Real road corridors | `"corridor": {"raster": ...}`, or pass a `(N,)` mask to `build_spatial_edges` |
 | Real annual labels | One sealed-state raster per year under `"labels"`, or a `(Y, N)` int array with `-1` for unknown |
 | A new baseline | Any `nn.Module` returning `STGNNOutput`; register it in `training/cli.py` |
+| A new loss term | An `nn.Module` taking a `LossContext`; `@register_term("name")`, then name it in `training.loss.terms` |
+| A different objective | `training.loss.terms` — a list of terms, weights and their own parameters |
+| A new optimiser | `@register_optimizer("name")` in `training/optim.py`, then `--optimizer name` |
+| A new schedule | `@register_scheduler("name")`, then `--scheduler name`; it is handed `max_epochs`, which is also the total step count |
+| A different year aggregation | `@register_aggregation("name")` in `losses/aggregation.py` |
+| A hyper-parameter search | `gnn-sar sweep sweep.json` — a grid over any dotted config key, one MLflow run per point |
 | A different tracking backend | `--tracking-uri`; anything MLflow accepts (a server, `sqlite:///mlflow.db`, Databricks) works without touching the code |
 | Joint space-time message passing | Consume `SpatioTemporalGraph.super_edge_index` directly |
 | A different composite length | `"period": "dekad"` or a number of days; `PeriodGrid` carries the calendar |

@@ -56,4 +56,7 @@ filterwarnings = [
     # Lightning substituting bf16 for fp16 AMP on a CPU runner is the
     # portability the precision flag promises, not a problem.
     "ignore:.*AMP with fp16 is not supported on CPU.*:UserWarning",
+    # A study area is one full-batch graph, so an epoch *is* a step and
+    # Lightning's advice to move a OneCycleLR to 'interval: step' is moot.
+    "ignore:.*OneCycleLR. scheduler is using",
 ]
