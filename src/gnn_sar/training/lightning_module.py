@@ -35,10 +35,12 @@ from torchmetrics.classification import (
 
 from gnn_sar.config import ModelConfig, TrainingConfig
 from gnn_sar.data.targets import IGNORE_INDEX, state_to_onset
-from gnn_sar.losses.weak import WeakTemporalSupervisionLoss, aggregate_year_logit
+from gnn_sar.losses.aggregation import iter_year_bags
+from gnn_sar.losses.registry import build_loss
 from gnn_sar.metrics.delay import detection_delay, onset_from_probability
 from gnn_sar.models.stgnn import STGNNOutput, SpatioTemporalGNN
 from gnn_sar.training.datamodule import move_batch_to_device
+from gnn_sar.training.optim import build_optimizer, build_scheduler
 
 __all__ = ["SoilSealingModule"]
 
@@ -57,13 +59,16 @@ class SoilSealingModule(pl.LightningModule):
         model: nn.Module | None = None,
         model_config: ModelConfig | None = None,
         training_config: TrainingConfig | None = None,
+        criterion: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.training_config = training_config or TrainingConfig()
         if model is None:
             model = SpatioTemporalGNN(model_config or ModelConfig())
         self.model = model
-        self.criterion = WeakTemporalSupervisionLoss(self.training_config.loss)
+        # The objective normally comes from the config, through the term
+        # registry; ``criterion`` is for the one written in Python instead.
+        self.criterion = criterion or build_loss(self.training_config.loss)
         self.save_hyperparameters(
             {"model": type(model).__name__, "training": asdict(self.training_config)}
         )
@@ -79,12 +84,57 @@ class SoilSealingModule(pl.LightningModule):
     def forward(self, features: Tensor, spatial_edge_index: Tensor) -> STGNNOutput:
         return self.model(features, spatial_edge_index)
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(
-            self.parameters(),
-            lr=self.training_config.learning_rate,
-            weight_decay=self.training_config.weight_decay,
+    def configure_optimizers(self) -> torch.optim.Optimizer | dict[str, Any]:
+        """The optimiser and schedule the config names.
+
+        A flat learning rate — the project's default, and what every run before
+        the registry used — returns the optimiser on its own, which is the form
+        Lightning treats as "no schedule at all".
+        """
+        training = self.training_config
+        optimizer = build_optimizer(self, training.optimizer)
+        scheduler = build_scheduler(
+            optimizer,
+            training.scheduler,
+            max_epochs=training.max_epochs,
+            available_metrics=self.logged_metric_names(),
         )
+        if scheduler is None:
+            return optimizer
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+
+    def logged_metric_names(self) -> set[str]:
+        """Every metric this module logs, so a schedule can be checked against it.
+
+        A plateau schedule that watches a name nothing produces would stall the
+        run at the first validation epoch with a Lightning error about a missing
+        key; naming the metrics here turns that into a configuration error
+        raised before the fit starts.
+        """
+        names = {
+            f"{split}/{term}"
+            for split in ("train", "val", "test")
+            for term in (*self.criterion.terms.keys(), "total")
+        }
+        names |= {
+            f"{split}/{level}_{metric}"
+            for split in ("val", "test")
+            for level in ("annual", "subannual")
+            for metric in ("accuracy", "f1", "iou", "kappa")
+        }
+        names |= {
+            f"{split}/delay_{name}"
+            for split in ("val", "test")
+            for name in (
+                "mean_delay",
+                "median_delay",
+                "detection_rate",
+                "false_alarm_rate",
+                "n_evaluated",
+                "n_missed",
+            )
+        }
+        return names
 
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> Tensor:
         del batch_idx
@@ -155,22 +205,25 @@ class SoilSealingModule(pl.LightningModule):
     def _annual_predictions(
         self, output: STGNNOutput, batch: dict[str, Any], mask: Tensor
     ) -> tuple[Tensor, Tensor]:
-        """Land-take probability per (year, node), aligned with the annual labels."""
+        """Land-take probability per (year, node), aligned with the annual labels.
+
+        The bags are the ones the ``weak_annual`` term trains on — the same
+        function builds both, so the rule the model is measured under cannot
+        drift from the rule it was trained under.
+        ``LossConfig.metric_aggregation`` is the way to separate them on purpose.
+        """
         cfg = self.training_config.loss
-        year_index = batch["year_index"]
-        annual_labels = batch["annual_labels"]
         probabilities, targets = [], []
-        for year in torch.unique(year_index):
-            members = output.onset_logits[year_index == year]
-            target = annual_labels[int(year)]
-            valid = mask & (target != IGNORE_INDEX)
-            if not bool(valid.any()):
-                continue
-            logit = aggregate_year_logit(
-                members[:, valid], cfg.aggregation, cfg.logsumexp_temperature
-            )
+        for logit, target in iter_year_bags(
+            output.onset_logits,
+            batch["year_index"],
+            batch["annual_labels"],
+            mask,
+            aggregation=cfg.effective_metric_aggregation,
+            temperature=cfg.logsumexp_temperature,
+        ):
             probabilities.append(torch.sigmoid(logit))
-            targets.append(target[valid])
+            targets.append(target)
         if not probabilities:
             empty = output.onset_logits.new_zeros(0)
             return empty, empty.long()

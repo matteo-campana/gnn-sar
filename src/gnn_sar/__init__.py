@@ -30,8 +30,13 @@ _LAZY: dict[str, str] = {
     # data
     "GraphConfig": "gnn_sar.config",
     "ModelConfig": "gnn_sar.config",
+    "LossConfig": "gnn_sar.config",
+    "LossTermConfig": "gnn_sar.config",
+    "OptimizerConfig": "gnn_sar.config",
+    "SchedulerConfig": "gnn_sar.config",
     "TrainingConfig": "gnn_sar.config",
     "ExperimentConfig": "gnn_sar.config",
+    "apply_overrides": "gnn_sar.config",
     "SpatioTemporalGraph": "gnn_sar.data.graph",
     "NodeGeometries": "gnn_sar.data.segmentation",
     "PeriodGrid": "gnn_sar.data.sentinel",
@@ -44,9 +49,14 @@ _LAZY: dict[str, str] = {
     "SpatioTemporalGNN": "gnn_sar.models.stgnn",
     # losses / metrics
     "WeakTemporalSupervisionLoss": "gnn_sar.losses.weak",
+    "build_loss": "gnn_sar.losses.registry",
+    "register_term": "gnn_sar.losses.registry",
+    "register_aggregation": "gnn_sar.losses.aggregation",
     "detection_delay": "gnn_sar.metrics.delay",
     # training
     "SoilSealingModule": "gnn_sar.training.lightning_module",
+    "register_optimizer": "gnn_sar.training.optim",
+    "register_scheduler": "gnn_sar.training.optim",
 }
 
 __all__ = ["__version__", *sorted(_LAZY)]
@@ -55,8 +65,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from gnn_sar.config import (
         ExperimentConfig,
         GraphConfig,
+        LossConfig,
+        LossTermConfig,
         ModelConfig,
+        OptimizerConfig,
+        SchedulerConfig,
         TrainingConfig,
+        apply_overrides,
     )
     from gnn_sar.data.graph import SpatioTemporalGraph
     from gnn_sar.data.segmentation import NodeGeometries
@@ -70,10 +85,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         SyntheticLandTakeScenario,
         make_synthetic_scenario,
     )
+    from gnn_sar.losses.aggregation import register_aggregation
+    from gnn_sar.losses.registry import build_loss, register_term
     from gnn_sar.losses.weak import WeakTemporalSupervisionLoss
     from gnn_sar.metrics.delay import detection_delay
     from gnn_sar.models.stgnn import SpatioTemporalGNN
     from gnn_sar.training.lightning_module import SoilSealingModule
+    from gnn_sar.training.optim import register_optimizer, register_scheduler
 
 
 def __getattr__(name: str) -> Any:

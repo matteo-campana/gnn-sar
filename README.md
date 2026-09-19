@@ -129,6 +129,77 @@ it is the one choosing the path; pass `--tracking-uri sqlite:///mlflow.db` (and
 `mlflow ui --backend-store-uri sqlite:///mlflow.db`) for the backend MLflow
 itself recommends.
 
+### Tuning: the objective, the optimiser and the schedule
+
+The three are chosen by name from a registry, not written into the code. `train`
+and `demo` share these flags:
+
+| Flag | What it does |
+| --- | --- |
+| `--optimizer` | `adamw` (default), `adam`, `sgd`, `rmsprop`, `adagrad`, `nadam` |
+| `--learning-rate` | the rate the optimiser starts at |
+| `--scheduler` | `none` (default), `cosine`, `cosine_warm_restarts`, `step`, `multistep`, `exponential`, `linear`, `onecycle`, `plateau` |
+| `--loss-aggregation` | `noisy_or` (default), `logsumexp`, `max` — how a year's composites become the one decision the annual label supervises |
+| `--set KEY=VALUE` | **any** config field, by its dotted name; repeatable, value read as JSON |
+
+```bash
+gnn-sar demo --optimizer sgd --learning-rate 0.01 --scheduler cosine              --set training.optimizer.params.momentum=0.9              --set training.scheduler.warmup_epochs=5              --set training.loss.smoothness_weight=0.2
+```
+
+A study area is one full-batch graph, so there is **one optimiser step per
+epoch**: a schedule spans `--max-epochs` and nothing has to be computed for it.
+`plateau` watches any metric the run logs (`--set
+training.scheduler.monitor=val/annual_f1`), and the name is checked before the
+fit starts rather than at the first validation epoch.
+
+The objective itself is a list of terms, so a run can reweight one, give it
+different hyper-parameters, drop it, or add one that is not in the proposal:
+
+```bash
+gnn-sar demo --set 'training.loss.terms=[
+  {"name": "weak_annual", "params": {"objective": "focal", "focal_gamma": 2.0}},
+  {"name": "smoothness", "weight": 0.2, "params": {"power": 1}}]'
+```
+
+`ARCHITECTURE.md` lists every term with its parameters, and shows how to
+register a new one.
+
+### Sweeps
+
+`gnn-sar sweep` runs one `train` or `demo` invocation per point of a grid over
+those same dotted keys, each as its own MLflow run:
+
+```json
+{
+  "command": "demo",
+  "argv": ["--models", "stgnn", "--max-epochs", "50"],
+  "base": {"training": {"max_epochs": 50}},
+  "grid": {
+    "training.optimizer.learning_rate": [1e-3, 3e-4],
+    "training.scheduler.name": ["none", "cosine"],
+    "training.loss.smoothness_weight": [0.0, 0.05, 0.2]
+  },
+  "seeds": [0, 1, 2],
+  "strategy": "grid"
+}
+```
+
+```bash
+gnn-sar sweep sweep.json --dry-run      # list and validate the 36 runs
+gnn-sar sweep sweep.json --output results/sweep.json
+```
+
+`docs/esempi/sweep.json` is a working one: twelve random points over the
+optimiser, the rate, the schedule and the smoothness weight, at three seeds.
+
+The grid is expanded — and every point validated — before the first fit, so a
+combination no config can express fails in a second instead of after the runs
+before it have finished. A point that raises is reported and the sweep carries
+on. `"strategy": "random"` draws `n_samples` combinations instead of the full
+product, reproducibly; `max_runs` caps either. Because the varied values are
+part of the config every run already logs, a sweep is filterable in the MLflow
+UI by the very parameters it varied.
+
 ## Working with real data
 
 Three commands take an area from the Copernicus archive to a sub-annual map:
@@ -227,9 +298,14 @@ composites of the same labelled year does not change the loss at all.
 | `gnn_sar.data.synthetic` | A land-take scenario with topological propagation and weak labels |
 | `gnn_sar.models.stgnn` | GraphSAGE/GAT spatial stage + causal temporal stage + two heads |
 | `gnn_sar.models.baselines` | The same model minus the graph, minus time, and a random forest |
-| `gnn_sar.losses.weak` | Multiple-instance annual loss, graph smoothness, single-onset |
+| `gnn_sar.losses.weak` | The default objective: multiple-instance annual loss, graph smoothness, single-onset |
+| `gnn_sar.losses.terms` | The five terms of the proposal, each separately registered and parameterised |
+| `gnn_sar.losses.registry` | Terms by name, composed into the objective a config describes |
+| `gnn_sar.losses.aggregation` | How a year's composites collapse into one decision — shared by the loss and the metrics |
 | `gnn_sar.metrics` | Detection delay, early-warning lead time, OA/F1/IoU/kappa |
-| `gnn_sar.training` | Lightning datamodule, module, MLflow tracking and the `gnn-sar search/ingest/train/demo` CLI |
+| `gnn_sar.training.optim` | Optimisers and learning-rate schedules by name |
+| `gnn_sar.training.sweep` | A grid over any dotted config key, one run per point |
+| `gnn_sar.training` | Lightning datamodule, module, MLflow tracking and the `gnn-sar search/ingest/train/demo/sweep` CLI |
 
 ## What the demo actually reports
 
@@ -298,8 +374,10 @@ Named so that nobody mistakes the scaffold for the system:
 pytest
 ```
 
-270 tests covering graph-construction invariants, the causality and
-monotonicity guarantees, the behaviour of each loss term, the metrics against
+338 tests covering graph-construction invariants, the causality and
+monotonicity guarantees, the behaviour of each loss term, every registered
+optimiser and schedule through a real fit, the dotted overrides and the sweep
+that is built on them, the metrics against
 scikit-learn, the date/label/ingestion accounting, the study-area grids, the preprocessing
 around SNAP, and two end-to-end cycles —
 one on the synthetic scenario, one from GeoTIFFs to a trained model and its

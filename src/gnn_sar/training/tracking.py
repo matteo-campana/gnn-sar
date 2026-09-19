@@ -86,6 +86,11 @@ def flatten_params(payload: Any, prefix: str = "") -> dict[str, Any]:
     ``{"training": {"loss": {"positive_weight": 1.0}}}`` becomes
     ``{"training.loss.positive_weight": 1.0}``. MLflow keeps parameters flat, so
     without this the nested sections would be logged as one unsearchable blob.
+
+    A list of sections — a configured objective's ``terms`` — is indexed by
+    position (``training.loss.terms.0.weight``), so two runs that composed the
+    objective differently can be compared term by term rather than as two
+    opaque strings.
     """
     if is_dataclass(payload) and not isinstance(payload, type):
         payload = asdict(payload)
@@ -93,12 +98,22 @@ def flatten_params(payload: Any, prefix: str = "") -> dict[str, Any]:
         return {prefix or "value": payload}
     flat: dict[str, Any] = {}
     for key, value in payload.items():
-        name = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(value, dict) or (is_dataclass(value) and not isinstance(value, type)):
-            flat.update(flatten_params(value, name))
-        else:
-            flat[name] = value
+        flat.update(_flatten_value(value, f"{prefix}.{key}" if prefix else str(key)))
     return flat
+
+
+def _flatten_value(value: Any, name: str) -> dict[str, Any]:
+    if isinstance(value, dict) or (is_dataclass(value) and not isinstance(value, type)):
+        return flatten_params(value, name)
+    if isinstance(value, (list, tuple)) and any(
+        isinstance(entry, dict) or (is_dataclass(entry) and not isinstance(entry, type))
+        for entry in value
+    ):
+        flat: dict[str, Any] = {}
+        for index, entry in enumerate(value):
+            flat.update(_flatten_value(entry, f"{name}.{index}"))
+        return flat
+    return {name: value}
 
 
 class RunTracker:

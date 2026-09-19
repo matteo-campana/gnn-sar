@@ -1,6 +1,6 @@
 """Command line entry point.
 
-Six subcommands, in the order a real study goes through them:
+Seven subcommands, in the order a real study goes through them:
 
 ``gnn-sar sites``
     the pilot study areas — Roma, Viterbo, Milano — with the one grid every
@@ -22,6 +22,10 @@ Six subcommands, in the order a real study goes through them:
     the same training and evaluation on the synthetic scenario, with the
     baselines, needing no data at all. It is the fastest way to check that an
     installation works and to see what the comparison of OS3 reports.
+``gnn-sar sweep``
+    one ``train`` or ``demo`` invocation per point of a parameter grid, each as
+    its own MLflow run. This is how the objective, the optimiser and the
+    schedule get tuned rather than guessed.
 
 ``docs/guida_dati_sentinel.md`` walks through the first four end to end.
 
@@ -30,6 +34,18 @@ flags. ``--accelerator``/``--devices``/``--precision`` are handed straight to
 Lightning, so a GPU run is the default invocation with nothing added, and
 ``--tracking-uri``/``--experiment-name``/``--run-name`` decide where MLflow
 records the run. Every run is tracked unless ``--no-tracking`` says otherwise.
+
+They also share the optimisation flags. ``--optimizer``, ``--learning-rate``,
+``--scheduler`` and ``--loss-aggregation`` name the four choices a run changes
+most often; ``--set KEY=VALUE`` reaches **any** field of the config by its
+dotted name, which is the same address a sweep file uses::
+
+    gnn-sar demo --optimizer sgd --set training.optimizer.params.momentum=0.9 \
+                 --scheduler cosine --set training.loss.smoothness_weight=0.2
+
+Nothing is hard-coded behind those names: the optimisers live in
+:mod:`gnn_sar.training.optim`, the loss terms in :mod:`gnn_sar.losses.registry`,
+and both registries accept new entries from outside the package.
 """
 
 from __future__ import annotations
@@ -44,8 +60,15 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 
-from gnn_sar.config import PRECISIONS, ExperimentConfig, ModelConfig
+from gnn_sar.config import (
+    PRECISIONS,
+    ExperimentConfig,
+    ModelConfig,
+    apply_overrides,
+)
 from gnn_sar.data.synthetic import make_synthetic_scenario
+from gnn_sar.losses.aggregation import AGGREGATIONS
+from gnn_sar.losses.registry import LOSS_TERMS
 from gnn_sar.models.baselines import (
     MLPBaseline,
     RandomForestBaseline,
@@ -54,6 +77,8 @@ from gnn_sar.models.baselines import (
 from gnn_sar.models.stgnn import SpatioTemporalGNN
 from gnn_sar.training.datamodule import SpatioTemporalGraphDataModule
 from gnn_sar.training.lightning_module import SoilSealingModule
+from gnn_sar.training.optim import OPTIMIZERS, SCHEDULERS
+from gnn_sar.training.sweep import SweepPoint, expand_sweep, load_sweep
 from gnn_sar.training.tracking import RunTracker, describe_destination, tracked_run
 
 __all__ = [
@@ -62,6 +87,7 @@ __all__ = [
     "run_search",
     "run_preprocess",
     "run_ingest_command",
+    "run_sweep",
     "run_training",
     "build_parser",
 ]
@@ -116,7 +142,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_preprocess_parser(subparsers)
     _add_ingest_parser(subparsers)
     _add_train_parser(subparsers)
+    _add_sweep_parser(subparsers)
     return parser
+
+
+def _add_sweep_parser(subparsers: Any) -> None:
+    sweep = subparsers.add_parser(
+        "sweep",
+        help="run one demo or train invocation per point of a parameter grid",
+    )
+    sweep.add_argument("config", type=Path, help="JSON sweep file")
+    sweep.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the runs the grid expands to and stop; every point is "
+        "validated, so this catches an impossible combination in a second",
+    )
+    sweep.add_argument("--output", type=Path, help="write the results as JSON")
 
 
 def _add_sites_parser(subparsers: Any) -> None:
@@ -299,6 +341,40 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         "study area needs on an Ampere or newer card (ignored on CPU)",
     )
 
+    optimisation = parser.add_argument_group("optimisation")
+    optimisation.add_argument(
+        "--optimizer",
+        choices=sorted(OPTIMIZERS),
+        help="which optimiser to fit with (default: the config's, adamw)",
+    )
+    optimisation.add_argument(
+        "--learning-rate", type=float, help="the optimiser's learning rate"
+    )
+    optimisation.add_argument(
+        "--scheduler",
+        choices=["none", *sorted(SCHEDULERS)],
+        help="learning-rate schedule; a study area is one full-batch graph, so "
+        "one step per epoch and the whole schedule spans --max-epochs",
+    )
+    optimisation.add_argument(
+        "--loss-aggregation",
+        choices=sorted(AGGREGATIONS),
+        help="how a year's composites collapse into the one decision the "
+        "annual label supervises",
+    )
+    optimisation.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        dest="overrides",
+        help="override any config field by its dotted name, repeatable "
+        "(e.g. --set training.loss.smoothness_weight=0.2 "
+        "--set training.optimizer.params.momentum=0.9). The value is read as "
+        "JSON, so numbers, booleans and lists work. Applied last, after the "
+        "config file and the flags above",
+    )
+
     tracking = parser.add_argument_group("mlflow tracking")
     tracking.add_argument(
         "--tracking-uri",
@@ -315,12 +391,20 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _resolve_config(args: argparse.Namespace) -> ExperimentConfig:
-    """The experiment config, with the command line layered on top of the file."""
-    config = (
-        ExperimentConfig.from_json(args.config)
-        if getattr(args, "config", None)
-        else ExperimentConfig()
-    )
+    """The experiment config, with the command line layered on top of the file.
+
+    Four layers, each more explicit than the last: the defaults, the JSON file
+    (or the config a sweep handed down in ``args.resolved_config``), the typed
+    flags, and finally ``--set``, which can reach any field at all and so has
+    the last word.
+    """
+    config = getattr(args, "resolved_config", None)
+    if config is None:
+        config = (
+            ExperimentConfig.from_json(args.config)
+            if getattr(args, "config", None)
+            else ExperimentConfig()
+        )
     training_overrides: dict[str, Any] = {}
     if args.accelerator:
         training_overrides["accelerator"] = args.accelerator
@@ -345,11 +429,77 @@ def _resolve_config(args: argparse.Namespace) -> ExperimentConfig:
     if args.run_name:
         tracking_overrides["run_name"] = args.run_name
 
-    return replace(
+    config = replace(
         config,
         training=replace(config.training, **training_overrides),
         tracking=replace(config.tracking, **tracking_overrides),
     )
+    # A bad override is a typing mistake at the prompt, not a bug: it deserves
+    # the message on its own rather than a traceback around it.
+    try:
+        config = apply_overrides(config, _optimisation_overrides(args))
+        config = apply_overrides(config, _parse_overrides(getattr(args, "overrides", [])))
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    _validate_registries(config)
+    return config
+
+
+def _optimisation_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """The typed optimisation flags, as the dotted keys they are shorthand for."""
+    flags = {
+        "training.optimizer.name": getattr(args, "optimizer", None),
+        "training.optimizer.learning_rate": getattr(args, "learning_rate", None),
+        "training.scheduler.name": getattr(args, "scheduler", None),
+        "training.loss.aggregation": getattr(args, "loss_aggregation", None),
+    }
+    return {key: value for key, value in flags.items() if value is not None}
+
+
+def _parse_overrides(pairs: list[str]) -> dict[str, Any]:
+    """``--set key=value`` pairs, with the value read as JSON where it can be.
+
+    JSON first means ``0.2`` is a number, ``true`` is a boolean and ``[1, 2]``
+    is a list; a bare word that is not valid JSON stays the string it looks
+    like, so ``--set training.optimizer.name=sgd`` needs no quoting.
+    """
+    overrides: dict[str, Any] = {}
+    for pair in pairs:
+        key, separator, raw = pair.partition("=")
+        if not separator or not key.strip():
+            raise SystemExit(f"--set expects KEY=VALUE, got {pair!r}")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw
+        overrides[key.strip()] = value
+    return overrides
+
+
+def _validate_registries(config: ExperimentConfig) -> None:
+    """Check every name the config selects before anything is built.
+
+    The registries cannot be reached from :mod:`gnn_sar.config` without a cycle,
+    so the names it carries are plain strings there. Resolving them here means a
+    typo costs a second at start-up rather than an epoch of fitting — which is
+    what makes a long sweep worth launching unattended.
+    """
+    training = config.training
+    for name, registry, kind in (
+        (training.optimizer.name, OPTIMIZERS, "optimizer"),
+        (training.loss.aggregation, AGGREGATIONS, "loss aggregation"),
+        (training.loss.effective_metric_aggregation, AGGREGATIONS, "metric aggregation"),
+        *[(spec.name, LOSS_TERMS, "loss term") for spec in training.loss.resolved_terms()],
+    ):
+        if name not in registry:
+            raise SystemExit(
+                f"unknown {kind} {name!r}, expected one of {sorted(registry)}"
+            )
+    if training.scheduler.enabled and training.scheduler.name not in SCHEDULERS:
+        raise SystemExit(
+            f"unknown scheduler {training.scheduler.name!r}, expected 'none' or "
+            f"one of {sorted(SCHEDULERS)}"
+        )
 
 
 def _build_trainer(config: ExperimentConfig, tracker: RunTracker) -> pl.Trainer:
@@ -362,8 +512,16 @@ def _build_trainer(config: ExperimentConfig, tracker: RunTracker) -> pl.Trainer:
     """
     training = config.training
     torch.set_float32_matmul_precision(training.matmul_precision)
+    # Without this the schedule would be invisible: a run would record the rate
+    # it was configured with rather than the one it actually trained at.
+    callbacks = (
+        [pl.callbacks.LearningRateMonitor(logging_interval="epoch")]
+        if training.scheduler.enabled and tracker.enabled
+        else []
+    )
     return pl.Trainer(
         max_epochs=training.max_epochs,
+        callbacks=callbacks,
         accelerator=training.accelerator,
         devices=training.devices,
         precision=training.precision,
@@ -384,9 +542,15 @@ def _build_trainer(config: ExperimentConfig, tracker: RunTracker) -> pl.Trainer:
 def _describe_runtime(trainer: pl.Trainer, config: ExperimentConfig) -> str:
     """One line naming the device actually selected, and where the run is logged."""
     device = trainer.strategy.root_device
+    training = config.training
+    schedule = (
+        training.scheduler.name if training.scheduler.enabled else "flat rate"
+    )
     return (
         f"runtime: {device.type} x{trainer.num_devices}, "
-        f"precision {config.training.precision} | {describe_destination(config.tracking)}"
+        f"precision {training.precision} | "
+        f"{training.optimizer.name} lr={training.optimizer.learning_rate:g} "
+        f"({schedule}) | {describe_destination(config.tracking)}"
     )
 
 
@@ -810,6 +974,64 @@ def _export_maps(
     return written
 
 
+def run_sweep(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Run every point of a parameter grid, each as its own tracked run.
+
+    The grid is expanded — and therefore fully validated — before the first fit
+    starts, so a combination no config can express fails immediately instead of
+    after the runs before it have already burned an afternoon.
+
+    A point that raises is reported and the sweep carries on: one divergent
+    corner of a grid should not cost the other nineteen.
+    """
+    sweep = load_sweep(args.config)
+    points = expand_sweep(sweep)
+    print(f"{len(points)} run(s) from {args.config}")
+    for point in points:
+        print(f"  [{point.index}] {point.label}")
+    if args.dry_run:
+        return []
+
+    runner = run_demo if sweep.command == "demo" else run_training
+    results: list[dict[str, Any]] = []
+    for point in points:
+        print(f"\n=== [{point.index + 1}/{len(points)}] {point.label} ===")
+        entry: dict[str, Any] = {
+            "index": point.index,
+            "overrides": point.overrides,
+            "seed": point.seed,
+        }
+        try:
+            entry["metrics"] = runner(_point_namespace(sweep, point))
+        except Exception as error:  # noqa: BLE001 - one bad point must not end the sweep
+            entry["error"] = f"{type(error).__name__}: {error}"
+            print(f"point {point.index} failed: {entry['error']}")
+        results.append(entry)
+
+    failed = [entry["index"] for entry in results if "error" in entry]
+    print(f"\n{len(results) - len(failed)}/{len(results)} run(s) finished")
+    if failed:
+        print(f"failed: {failed}")
+    return results
+
+
+def _point_namespace(sweep: Any, point: SweepPoint) -> argparse.Namespace:
+    """One sweep point as the command-line invocation it stands for.
+
+    The sweep's ``argv`` goes through the real parser, so its arguments mean
+    exactly what they mean on the command line and a mistake in the file is the
+    same error it would be there. The point's config is attached rather than
+    written to a temporary file, which is what ``_resolve_config`` reads it from.
+    """
+    args = build_parser().parse_args([sweep.command, *sweep.argv])
+    args.resolved_config = point.config
+    if point.seed is not None:
+        args.seed = point.seed
+    base_name = args.run_name or sweep.command
+    args.run_name = f"{base_name}-{point.label}"
+    return args
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -831,6 +1053,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "train":
         run_training(args)
+        return 0
+    if args.command == "sweep":
+        results = run_sweep(args)
+        if args.output:
+            args.output.write_text(
+                json.dumps(results, indent=2, sort_keys=True), encoding="utf-8"
+            )
         return 0
     if args.command != "demo":  # pragma: no cover - argparse enforces the choice
         raise SystemExit(f"unknown command {args.command!r}")
