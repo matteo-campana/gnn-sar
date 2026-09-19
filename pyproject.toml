@@ -12,6 +12,7 @@ torch = "2.6.0"
 pytorch-lightning = "2.5.0"
 torch-geometric = "^2.8"
 torchmetrics = "^1.4"
+mlflow = ">=2.19,<4"
 numpy = "^2.0"
 scipy = "^1.13"
 scikit-image = { version = "^0.24", optional = true }
@@ -52,4 +53,7 @@ filterwarnings = [
     "ignore::FutureWarning:torch.jit._script",
     "ignore:.*does not have many workers.*:UserWarning",
     "ignore:.*LeafSpec.*:FutureWarning",
+    # Lightning substituting bf16 for fp16 AMP on a CPU runner is the
+    # portability the precision flag promises, not a problem.
+    "ignore:.*AMP with fp16 is not supported on CPU.*:UserWarning",
 ]

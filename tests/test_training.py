@@ -10,7 +10,10 @@ from gnn_sar.data.targets import IGNORE_INDEX
 from gnn_sar.models.baselines import TemporalBaseline
 from gnn_sar.models.stgnn import SpatioTemporalGNN
 from gnn_sar.training.cli import build_parser, run_demo
-from gnn_sar.training.datamodule import SpatioTemporalGraphDataModule
+from gnn_sar.training.datamodule import (
+    SpatioTemporalGraphDataModule,
+    move_batch_to_device,
+)
 from gnn_sar.training.lightning_module import SoilSealingModule
 
 
@@ -223,6 +226,9 @@ def test_the_demo_runs_every_requested_model_end_to_end(tmp_path):
             "8",
             "--periods-per-year",
             "4",
+            "--accelerator",
+            "cpu",
+            "--no-tracking",
         ]
     )
 
@@ -279,6 +285,8 @@ def test_training_on_an_ingested_area_writes_metrics_and_georeferenced_maps(
             "2",
             "--output-dir",
             str(tmp_path / "run"),
+            "--accelerator",
+            "cpu",
         ]
     )
     metrics = run_training(args)
@@ -292,3 +300,168 @@ def test_training_on_an_ingested_area_writes_metrics_and_georeferenced_maps(
     with rasterio.open(tmp_path / "run" / "sealed_probability.tif") as raster:
         assert raster.count == graph.n_time  # one band per composite
         assert raster.crs.to_string() == "EPSG:32633"
+
+
+# --------------------------------------------------------------- device handling
+#
+# The graph is built on the CPU and the model may live anywhere. These are the
+# seams where that used to go wrong: a batch handed straight to a module that
+# ``Trainer.fit`` had already moved to a GPU raised "expected all tensors to be
+# on the same device".
+
+
+def test_moving_a_batch_carries_the_non_tensor_entries_across(datamodule):
+    batch = datamodule.batch("train")
+
+    moved = move_batch_to_device(batch, torch.device("cpu"))
+
+    assert moved["split"] == "train"
+    assert moved["temporal_order"] == batch["temporal_order"]
+    assert moved["state_labels"] is None  # the weak regime carries no exact labels
+    assert torch.equal(moved["features"], batch["features"])
+    assert moved is not batch
+
+
+def test_a_split_is_moved_to_a_device_only_once(datamodule):
+    """Re-copying the whole feature tensor every step is the cost this avoids."""
+    first = datamodule.transfer_batch_to_device(
+        datamodule.batch("train"), torch.device("cpu"), 0
+    )
+    second = datamodule.transfer_batch_to_device(
+        datamodule.batch("train"), torch.device("cpu"), 0
+    )
+
+    assert first is second
+    assert first["features"] is second["features"]
+
+
+def test_the_cache_is_keyed_by_split(datamodule):
+    train = datamodule.batch("train", device=torch.device("cpu"))
+    test = datamodule.batch("test", device=torch.device("cpu"))
+
+    assert train is not test
+    assert not torch.equal(train["node_mask"], test["node_mask"])
+
+
+def test_teardown_releases_the_device_copies(datamodule):
+    """A demo fits several models in one process; each must give its memory back."""
+    datamodule.batch("train", device=torch.device("cpu"))
+    assert datamodule._device_batches
+
+    datamodule.teardown()
+
+    assert datamodule._device_batches == {}
+    # The CPU batches built by setup() survive, so the next stage costs nothing.
+    assert datamodule.batch("train")["features"] is not None
+
+
+def test_predict_maps_moves_the_batch_onto_the_module_device(datamodule, monkeypatch):
+    """The contract that makes a CPU-built batch safe to feed a GPU module."""
+    from gnn_sar.training import lightning_module as module_under_test
+
+    module = SoilSealingModule(
+        model=SpatioTemporalGNN(
+            ModelConfig(in_channels=datamodule.n_features, hidden_channels=16)
+        )
+    )
+    seen: list[torch.device] = []
+    original = module_under_test.move_batch_to_device
+
+    def spy(batch, device):
+        seen.append(device)
+        return original(batch, device)
+
+    monkeypatch.setattr(module_under_test, "move_batch_to_device", spy)
+    module.predict_maps(datamodule.batch("test"))
+
+    assert seen == [module.device]
+
+
+def test_predict_maps_leaves_the_training_mode_as_it_found_it(datamodule):
+    """Called between two epochs, it must not silently switch dropout off."""
+    module = SoilSealingModule(
+        model=SpatioTemporalGNN(
+            ModelConfig(in_channels=datamodule.n_features, hidden_channels=16)
+        )
+    )
+    module.train()
+
+    module.predict_maps(datamodule.batch("test"))
+
+    assert module.training
+
+
+def test_trainer_predict_returns_the_same_maps(datamodule):
+    """``predict_step`` is what lets Lightning own the device placement."""
+    module = SoilSealingModule(
+        model=SpatioTemporalGNN(
+            ModelConfig(in_channels=datamodule.n_features, hidden_channels=16)
+        )
+    )
+    trainer = _trainer()
+
+    maps = trainer.predict(module, datamodule=datamodule)[0]
+
+    n_time, n_nodes = datamodule.graph.n_time, datamodule.graph.n_nodes
+    assert maps["sealed_probability"].shape == (n_time, n_nodes)
+    assert np.allclose(
+        maps["sealed_probability"],
+        module.predict_maps(datamodule.batch("test"))["sealed_probability"],
+    )
+
+
+@pytest.mark.parametrize("precision", ["bf16-mixed", "16-mixed"])
+def test_a_mixed_precision_cycle_still_produces_maps(datamodule, precision):
+    """``bfloat16`` has no NumPy dtype, so the metric conversion has to upcast."""
+    module = SoilSealingModule(
+        model=SpatioTemporalGNN(
+            ModelConfig(in_channels=datamodule.n_features, hidden_channels=16)
+        )
+    )
+    trainer = pl.Trainer(
+        max_epochs=1,
+        accelerator="cpu",
+        devices=1,
+        precision=precision,
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        enable_progress_bar=False,
+    )
+
+    trainer.fit(module, datamodule=datamodule)
+    maps = trainer.predict(module, datamodule=datamodule)[0]
+
+    assert maps["onset"].shape == (datamodule.graph.n_nodes,)
+    assert np.isfinite(maps["sealed_probability"]).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_a_full_cycle_runs_on_a_gpu(datamodule):
+    """The end-to-end GPU path: fit, test and predict with nothing moved by hand."""
+    module = SoilSealingModule(
+        model=SpatioTemporalGNN(
+            ModelConfig(in_channels=datamodule.n_features, hidden_channels=16)
+        )
+    )
+    trainer = pl.Trainer(
+        max_epochs=2,
+        accelerator="gpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        enable_progress_bar=False,
+    )
+
+    trainer.fit(module, datamodule=datamodule)
+    metrics = trainer.test(module, datamodule=datamodule, verbose=False)[0]
+    # A CPU-built batch fed to a module that now lives on the GPU.
+    maps = module.predict_maps(datamodule.batch("test"))
+
+    assert module.device.type == "cuda"
+    assert 0.0 <= metrics["test/annual_f1"] <= 1.0
+    assert maps["sealed_probability"].shape == (
+        datamodule.graph.n_time,
+        datamodule.graph.n_nodes,
+    )

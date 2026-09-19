@@ -13,21 +13,15 @@ from typing import Any
 import numpy as np
 
 from gnn_sar.data.targets import IGNORE_INDEX
+from gnn_sar.metrics._convert import to_numpy
 
 __all__ = ["confusion_matrix", "sealing_metrics"]
 
 
-def _to_numpy(values: Any) -> np.ndarray:
-    detach = getattr(values, "detach", None)
-    if detach is not None:
-        values = detach().cpu().numpy()
-    return np.asarray(values)
-
-
 def confusion_matrix(prediction: Any, target: Any) -> np.ndarray:
     """``2x2`` matrix ``[[tn, fp], [fn, tp]]``, skipping ``-1`` targets."""
-    prediction = _to_numpy(prediction).astype(np.int64).ravel()
-    target = _to_numpy(target).astype(np.int64).ravel()
+    prediction = to_numpy(prediction).astype(np.int64).ravel()
+    target = to_numpy(target).astype(np.int64).ravel()
     if prediction.shape != target.shape:
         raise ValueError(
             f"prediction {prediction.shape} and target {target.shape} differ"

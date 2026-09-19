@@ -5,6 +5,14 @@ step sees the whole spatio-temporal graph and the splits are **node masks** cut
 along a geographic axis. Sampling nodes at random instead would leak the test
 set into training through the very edges the model is built to exploit — the
 leakage the proposal's protocol (§5.4) explicitly rules out.
+
+That shape also decides how the data reaches an accelerator. Since every step
+consumes the *same* tensors, the datamodule moves each split to the device once
+and caches it (:meth:`~SpatioTemporalGraphDataModule.transfer_batch_to_device`)
+instead of letting Lightning copy the full feature tensor across the PCIe bus on
+every step — for a province-sized area that copy, not the convolutions,
+dominates the epoch. The cache is keyed by device, so moving a datamodule
+between CPU and GPU stays correct.
 """
 
 from __future__ import annotations
@@ -24,9 +32,22 @@ from gnn_sar.data.targets import (
     state_to_horizon_target,
 )
 
-__all__ = ["GraphBatch", "SpatioTemporalGraphDataModule"]
+__all__ = ["GraphBatch", "SpatioTemporalGraphDataModule", "move_batch_to_device"]
 
 GraphBatch = dict[str, Any]
+
+
+def move_batch_to_device(batch: GraphBatch, device: Any) -> GraphBatch:
+    """A copy of ``batch`` whose tensors live on ``device``.
+
+    Non-tensor entries (the split name, ``temporal_order``, the ``None`` that
+    stands for absent exact labels) are carried over untouched, which is exactly
+    what Lightning's own transfer would do with them.
+    """
+    return {
+        key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
+        for key, value in batch.items()
+    }
 
 
 class _SingleGraphDataset(Dataset):
@@ -87,12 +108,14 @@ class SpatioTemporalGraphDataModule(pl.LightningDataModule):
         self.standardizer: FeatureStandardizer | None = None
         self.masks: dict[str, np.ndarray] = {}
         self._batches: dict[str, GraphBatch] = {}
+        self._device_batches: dict[tuple[str, str], GraphBatch] = {}
 
     @property
     def n_features(self) -> int:
         return self.graph.n_features
 
     def setup(self, stage: str | None = None) -> None:
+        del stage  # every split is prepared at once; there is only one graph
         if self._batches:
             return
         masks = self.graph.split_nodes(self.split_fractions, self.split_axis)  # type: ignore[arg-type]
@@ -159,11 +182,52 @@ class SpatioTemporalGraphDataModule(pl.LightningDataModule):
     def predict_dataloader(self) -> DataLoader:
         return self._loader("test")
 
-    def batch(self, split: str) -> GraphBatch:
-        """The prepared batch of a split, e.g. to evaluate outside a Trainer."""
+    def batch(self, split: str, device: Any | None = None) -> GraphBatch:
+        """The prepared batch of a split, e.g. to evaluate outside a Trainer.
+
+        Args:
+            split: ``"train"``, ``"val"`` or ``"test"``.
+            device: where the tensors should live. ``None`` keeps them on the CPU,
+                where :meth:`setup` built them. Pass a module's ``.device`` to
+                feed a model that has already been moved to an accelerator.
+        """
         if not self._batches:
             self.setup()
-        return self._batches[split]
+        batch = self._batches[split]
+        if device is None:
+            return batch
+        return self._cached_on_device(batch, device)
+
+    def _cached_on_device(self, batch: GraphBatch, device: Any) -> GraphBatch:
+        """``batch`` on ``device``, moved at most once per (split, device) pair."""
+        key = (str(batch["split"]), str(torch.device(device)))
+        cached = self._device_batches.get(key)
+        if cached is None:
+            cached = move_batch_to_device(batch, device)
+            self._device_batches[key] = cached
+        return cached
+
+    def transfer_batch_to_device(
+        self, batch: GraphBatch, device: Any, dataloader_idx: int
+    ) -> GraphBatch:
+        """Lightning's device hook, served from the per-device cache.
+
+        Overriding it is what makes a GPU run cheap here: the default hook would
+        copy the whole ``(T, N, C)`` feature tensor, the edge index and every
+        label tensor host-to-device once per step, for tensors that never change.
+        """
+        del dataloader_idx
+        return self._cached_on_device(batch, device)
+
+    def teardown(self, stage: str | None = None) -> None:
+        """Release the accelerator copies, keeping the CPU batches.
+
+        Without this, the device cache would pin a study area's worth of GPU
+        memory for the whole process — long enough to matter when a script fits
+        several models one after another, as the demo does.
+        """
+        del stage
+        self._device_batches.clear()
 
 
 def _identity_collate(items: list[GraphBatch]) -> GraphBatch:

@@ -239,6 +239,20 @@ The consequence is that the whole study area is one batch and the splits are
 **node masks**, not separate datasets; the datamodule serves the same graph
 three times with a different mask.
 
+That shape decides how the data reaches an accelerator. Every step consumes the
+same tensors, so `SpatioTemporalGraphDataModule.transfer_batch_to_device` moves a
+split to the device **once** and caches it, instead of letting Lightning copy the
+`(T, N, D)` feature tensor, the edge index and every label tensor across the bus
+on each step — for a province-sized area that copy, not the convolutions, is what
+an epoch is spent on. The cache is keyed by device and released in `teardown`, so
+fitting several models in one process (what `demo` does) hands the memory back
+between them.
+
+It also explains why the device count is not a knob worth turning: one graph
+cannot be split across GPUs, so `--devices 2` would replicate it rather than
+divide the work. The lever that buys headroom is `--precision`: `bf16-mixed`
+roughly halves what the feature tensor occupies.
+
 ### 8. Metrics say *when*, not just *whether*
 
 `metrics/classification.py` gives the four the SNPA validation uses (OA, F1,
@@ -261,6 +275,33 @@ delay **only** when exact dates exist. A sub-annual F1 computed against annual
 labels would be measuring the model against a target that does not exist, so the
 module simply does not produce one.
 
+The metric modules score with NumPy, so every tensor crosses that boundary
+through `metrics/_convert.to_numpy`, which upcasts reduced-precision floats
+first: `bfloat16` has no NumPy dtype at all, and `Tensor.numpy()` raises on it, so
+without the upcast a `bf16-mixed` run would fail at the point where it computes
+the onset map rather than at the point where precision was chosen.
+
+### 9. A run is an MLflow run
+
+`training/tracking.py` wraps the Lightning `MLFlowLogger` in a `RunTracker` that
+is also usable in its disabled form, so no call site branches on whether tracking
+is on: a disabled tracker accepts every call, does nothing, and hands the Trainer
+`False` instead of a logger.
+
+What a run holds:
+
+| Kind | Content |
+| --- | --- |
+| Parameters | the whole resolved `ExperimentConfig`, flattened to dotted names (`training.loss.positive_weight`), plus the scenario or study area the run read |
+| Metrics | every value the Lightning loop logs, per epoch — each loss term separately, the annual and sub-annual metrics, the delays |
+| Tags | `command`, `model`, and the data the run used, which is what makes the OS3 ablation a filter rather than a diff of console logs |
+| Artefacts | `config.json`, `metrics.json`, the checkpoint, and the sub-annual GeoTIFFs |
+
+The tracking URI resolves from the flag, then `MLFLOW_TRACKING_URI`, then a local
+`./mlruns`. Relative paths are made absolute on purpose: MLflow resolves them
+against the working directory, so a run started from a subdirectory would
+otherwise open a second store without saying so.
+
 ## Extension points
 
 | To add | Where |
@@ -273,6 +314,7 @@ module simply does not produce one.
 | Real road corridors | `"corridor": {"raster": ...}`, or pass a `(N,)` mask to `build_spatial_edges` |
 | Real annual labels | One sealed-state raster per year under `"labels"`, or a `(Y, N)` int array with `-1` for unknown |
 | A new baseline | Any `nn.Module` returning `STGNNOutput`; register it in `training/cli.py` |
+| A different tracking backend | `--tracking-uri`; anything MLflow accepts (a server, `sqlite:///mlflow.db`, Databricks) works without touching the code |
 | Joint space-time message passing | Consume `SpatioTemporalGraph.super_edge_index` directly |
 | A different composite length | `"period": "dekad"` or a number of days; `PeriodGrid` carries the calendar |
 | A new study area | An entry in `PILOT_SITES`: bbox, CRS, extent snapped to whole pixels |

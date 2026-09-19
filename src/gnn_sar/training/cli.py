@@ -24,12 +24,19 @@ Six subcommands, in the order a real study goes through them:
     installation works and to see what the comparison of OS3 reports.
 
 ``docs/guida_dati_sentinel.md`` walks through the first four end to end.
+
+Both commands that train — ``train`` and ``demo`` — share the same runtime
+flags. ``--accelerator``/``--devices``/``--precision`` are handed straight to
+Lightning, so a GPU run is the default invocation with nothing added, and
+``--tracking-uri``/``--experiment-name``/``--run-name`` decide where MLflow
+records the run. Every run is tracked unless ``--no-tracking`` says otherwise.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +44,7 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 
-from gnn_sar.config import ExperimentConfig, ModelConfig
+from gnn_sar.config import PRECISIONS, ExperimentConfig, ModelConfig
 from gnn_sar.data.synthetic import make_synthetic_scenario
 from gnn_sar.models.baselines import (
     MLPBaseline,
@@ -47,6 +54,7 @@ from gnn_sar.models.baselines import (
 from gnn_sar.models.stgnn import SpatioTemporalGNN
 from gnn_sar.training.datamodule import SpatioTemporalGraphDataModule
 from gnn_sar.training.lightning_module import SoilSealingModule
+from gnn_sar.training.tracking import RunTracker, describe_destination, tracked_run
 
 __all__ = [
     "main",
@@ -101,6 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     demo.add_argument("--seed", type=int, default=0)
     demo.add_argument("--output", type=Path, help="write the results as JSON")
+    _add_runtime_arguments(demo)
 
     _add_sites_parser(subparsers)
     _add_search_parser(subparsers)
@@ -263,15 +272,143 @@ def _add_train_parser(subparsers: Any) -> None:
         action="store_true",
         help="skip the GeoTIFF export even when the area carries a grid",
     )
+    _add_runtime_arguments(train)
+
+
+def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
+    """Hardware and tracking flags, shared by every command that trains.
+
+    All of them default to ``None`` and override the config only when given, so
+    a JSON config stays authoritative unless the command line contradicts it.
+    """
+    hardware = parser.add_argument_group("hardware")
+    hardware.add_argument(
+        "--accelerator",
+        choices=["auto", "cpu", "gpu", "cuda", "mps", "tpu"],
+        help="where to run; the default 'auto' picks a GPU when there is one",
+    )
+    hardware.add_argument(
+        "--devices",
+        help="how many devices, or 'auto'. A study area is a single full-batch "
+        "graph, so more than one device replicates it instead of splitting it",
+    )
+    hardware.add_argument(
+        "--precision",
+        choices=list(PRECISIONS),
+        help="Lightning precision; 'bf16-mixed' roughly halves the memory a "
+        "study area needs on an Ampere or newer card (ignored on CPU)",
+    )
+
+    tracking = parser.add_argument_group("mlflow tracking")
+    tracking.add_argument(
+        "--tracking-uri",
+        help="MLflow tracking URI; defaults to MLFLOW_TRACKING_URI, then to a "
+        "local ./mlruns that `mlflow ui` reads as-is",
+    )
+    tracking.add_argument("--experiment-name", help="MLflow experiment to log under")
+    tracking.add_argument("--run-name", help="name of the MLflow run")
+    tracking.add_argument(
+        "--no-tracking",
+        action="store_true",
+        help="do not record the run at all",
+    )
+
+
+def _resolve_config(args: argparse.Namespace) -> ExperimentConfig:
+    """The experiment config, with the command line layered on top of the file."""
+    config = (
+        ExperimentConfig.from_json(args.config)
+        if getattr(args, "config", None)
+        else ExperimentConfig()
+    )
+    training_overrides: dict[str, Any] = {}
+    if args.accelerator:
+        training_overrides["accelerator"] = args.accelerator
+    if args.devices:
+        training_overrides["devices"] = (
+            int(args.devices) if str(args.devices).isdigit() else args.devices
+        )
+    if args.precision:
+        training_overrides["precision"] = args.precision
+    if getattr(args, "max_epochs", None):
+        # Folded into the config rather than kept beside it, so the value MLflow
+        # records as ``training.max_epochs`` is the one the Trainer ran.
+        training_overrides["max_epochs"] = args.max_epochs
+
+    tracking_overrides: dict[str, Any] = {}
+    if args.no_tracking:
+        tracking_overrides["enabled"] = False
+    if args.tracking_uri:
+        tracking_overrides["tracking_uri"] = args.tracking_uri
+    if args.experiment_name:
+        tracking_overrides["experiment_name"] = args.experiment_name
+    if args.run_name:
+        tracking_overrides["run_name"] = args.run_name
+
+    return replace(
+        config,
+        training=replace(config.training, **training_overrides),
+        tracking=replace(config.tracking, **tracking_overrides),
+    )
+
+
+def _build_trainer(config: ExperimentConfig, tracker: RunTracker) -> pl.Trainer:
+    """The one Trainer every command uses.
+
+    Lightning owns the device placement: the accelerator, the device count and
+    the precision come from the config, and the datamodule's transfer hook puts
+    the graph where the model already is. Nothing below this function mentions
+    ``cuda``.
+    """
+    training = config.training
+    torch.set_float32_matmul_precision(training.matmul_precision)
+    return pl.Trainer(
+        max_epochs=training.max_epochs,
+        accelerator=training.accelerator,
+        devices=training.devices,
+        precision=training.precision,
+        gradient_clip_val=training.gradient_clip_val,
+        log_every_n_steps=training.log_every_n_steps,
+        # ``warn`` rather than ``True``: some of the scatter kernels
+        # torch-geometric dispatches to have no deterministic implementation, and
+        # hard-failing on them would make the flag unusable.
+        deterministic="warn" if training.deterministic else False,
+        # The checkpoint is written explicitly, once, next to the metrics, so
+        # Lightning's own checkpoint callback would only duplicate it.
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        logger=tracker.trainer_logger,
+    )
+
+
+def _describe_runtime(trainer: pl.Trainer, config: ExperimentConfig) -> str:
+    """One line naming the device actually selected, and where the run is logged."""
+    device = trainer.strategy.root_device
+    return (
+        f"runtime: {device.type} x{trainer.num_devices}, "
+        f"precision {config.training.precision} | {describe_destination(config.tracking)}"
+    )
+
+
+def _build_module(
+    name: str, config: ExperimentConfig, n_features: int
+) -> SoilSealingModule:
+    """The Lightning module for one of the compared models."""
+    model_config = ModelConfig(**{**config.model.__dict__, "in_channels": n_features})
+    return SoilSealingModule(
+        model=_MODELS[name](model_config), training_config=config.training
+    )
 
 
 def run_demo(args: argparse.Namespace) -> dict[str, dict[str, float]]:
-    """Run the synthetic experiment and return one metric dict per model."""
-    config = (
-        ExperimentConfig.from_json(args.config) if args.config else ExperimentConfig()
-    )
-    max_epochs = args.max_epochs or config.training.max_epochs
+    """Run the synthetic experiment and return one metric dict per model.
+
+    Each model gets its own MLflow run, tagged with its name, so the ablation of
+    OS3 is a single filter in the MLflow UI rather than a diff of stdout.
+    """
+    config = _resolve_config(args)
     pl.seed_everything(args.seed, workers=True)
+    print(describe_destination(config.tracking))
 
     block = 4
     side = args.nodes_per_side * block
@@ -286,41 +423,62 @@ def run_demo(args: argparse.Namespace) -> dict[str, dict[str, float]]:
         seed=args.seed,
     )
     graph = scenario.with_exact_labels() if args.exact_labels else scenario.graph
+    scenario_params = {
+        "scenario.nodes_per_side": args.nodes_per_side,
+        "scenario.n_time": args.n_time,
+        "scenario.periods_per_year": args.periods_per_year,
+        "scenario.contrast": args.contrast,
+        "scenario.exact_labels": args.exact_labels,
+        "run.seed": args.seed,
+    }
 
     results: dict[str, dict[str, float]] = {}
     for name in args.models:
-        datamodule = SpatioTemporalGraphDataModule(
-            graph,
-            graph_config=config.graph,
-            prediction_horizon=config.model.prediction_horizon,
-        )
-        datamodule.setup()
-        if name == _RANDOM_FOREST:
-            results[name] = _run_random_forest(graph, datamodule)
-            continue
-        model_config = ModelConfig(
-            **{**config.model.__dict__, "in_channels": datamodule.n_features}
-        )
-        module = SoilSealingModule(
-            model=_MODELS[name](model_config), training_config=config.training
-        )
-        trainer = pl.Trainer(
-            max_epochs=max_epochs,
-            accelerator=config.training.accelerator,
-            devices=config.training.devices,
-            gradient_clip_val=config.training.gradient_clip_val,
-            log_every_n_steps=config.training.log_every_n_steps,
-            enable_checkpointing=False,
-            enable_model_summary=False,
-            logger=False,
-        )
-        trainer.fit(module, datamodule=datamodule)
-        metrics = trainer.test(module, datamodule=datamodule, verbose=False)[0]
-
-        # The exact onsets are never used for training; they are the yardstick.
-        metrics.update(_delay_against_truth(module, datamodule, scenario))
-        results[name] = {key: float(value) for key, value in metrics.items()}
+        run_name = f"{args.run_name}-{name}" if args.run_name else name
+        with tracked_run(
+            config.tracking,
+            run_name=run_name,
+            tags={"command": "demo", "model": name, "data": "synthetic"},
+        ) as tracker:
+            tracker.log_params(config)
+            tracker.log_params({**scenario_params, "run.model": name})
+            metrics = _demo_one_model(name, graph, scenario, config, tracker)
+            tracker.log_json(metrics, "metrics.json")
+            results[name] = metrics
     return results
+
+
+def _demo_one_model(
+    name: str,
+    graph: Any,
+    scenario: Any,
+    config: ExperimentConfig,
+    tracker: RunTracker,
+) -> dict[str, float]:
+    """Fit and score one model of the comparison inside an open MLflow run."""
+    datamodule = SpatioTemporalGraphDataModule(
+        graph,
+        graph_config=config.graph,
+        prediction_horizon=config.model.prediction_horizon,
+    )
+    datamodule.setup()
+    if name == _RANDOM_FOREST:
+        # No Trainer, so its metrics have to be logged by hand.
+        metrics = _run_random_forest(graph, datamodule)
+        tracker.log_metrics(metrics)
+        return metrics
+
+    module = _build_module(name, config, datamodule.n_features)
+    trainer = _build_trainer(config, tracker)
+    print(_describe_runtime(trainer, config))
+    trainer.fit(module, datamodule=datamodule)
+    metrics = trainer.test(module, datamodule=datamodule, verbose=False)[0]
+
+    # The exact onsets are never used for training; they are the yardstick.
+    against_truth = _delay_against_truth(trainer, module, datamodule, scenario)
+    tracker.log_metrics(against_truth)
+    metrics.update(against_truth)
+    return {key: float(value) for key, value in metrics.items()}
 
 
 def _run_random_forest(
@@ -345,15 +503,21 @@ def _run_random_forest(
 
 
 def _delay_against_truth(
+    trainer: pl.Trainer,
     module: SoilSealingModule,
     datamodule: SpatioTemporalGraphDataModule,
     scenario: Any,
 ) -> dict[str, float]:
+    """Detection delay against the scenario's true onsets.
+
+    The maps come from ``Trainer.predict`` rather than from the module directly,
+    so the graph is moved to whatever device the fit ran on by the same hook the
+    training loop used.
+    """
     from gnn_sar.metrics.delay import detection_delay
 
-    batch = datamodule.batch("test")
-    mask = batch["node_mask"].numpy()
-    maps = module.predict_maps(batch)
+    maps = trainer.predict(module, datamodule=datamodule)[0]
+    mask = datamodule.masks["test"]
     delay = detection_delay(
         maps["onset"][mask], scenario.onset[mask], n_time=scenario.graph.n_time
     )
@@ -501,14 +665,17 @@ def run_ingest_command(args: argparse.Namespace) -> Path:
 
 
 def run_training(args: argparse.Namespace) -> dict[str, float]:
-    """Train one model on an ingested study area and report its metrics."""
+    """Train one model on an ingested study area and report its metrics.
+
+    Everything the run produced — the config, the metrics, the checkpoint and the
+    sub-annual GeoTIFFs — is attached to a single MLflow run, so a result can be
+    traced back to the exact settings that made it.
+    """
     from gnn_sar.data.study_area import load_study_area
 
-    config = (
-        ExperimentConfig.from_json(args.config) if args.config else ExperimentConfig()
-    )
-    max_epochs = args.max_epochs or config.training.max_epochs
+    config = _resolve_config(args)
     pl.seed_everything(args.seed, workers=True)
+    print(describe_destination(config.tracking))
 
     area = load_study_area(args.area)
     print(area.describe())
@@ -523,64 +690,104 @@ def run_training(args: argparse.Namespace) -> dict[str, float]:
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.model == _RANDOM_FOREST:
-        metrics = _run_random_forest(area.graph, datamodule)
-    else:
-        model_config = ModelConfig(
-            **{**config.model.__dict__, "in_channels": datamodule.n_features}
+    run_name = args.run_name or f"{args.model}-{Path(args.area).stem}"
+    with tracked_run(
+        config.tracking,
+        run_name=run_name,
+        tags={"command": "train", "model": args.model, "area": Path(args.area).name},
+    ) as tracker:
+        tracker.log_params(config)
+        tracker.log_params(
+            {
+                "run.model": args.model,
+                "run.area": str(args.area),
+                "run.seed": args.seed,
+                "area.n_nodes": area.graph.n_nodes,
+                "area.n_time": area.graph.n_time,
+                "area.n_features": datamodule.n_features,
+            }
         )
-        module = SoilSealingModule(
-            model=_MODELS[args.model](model_config), training_config=config.training
-        )
-        trainer = pl.Trainer(
-            max_epochs=max_epochs,
-            accelerator=config.training.accelerator,
-            devices=config.training.devices,
-            gradient_clip_val=config.training.gradient_clip_val,
-            log_every_n_steps=config.training.log_every_n_steps,
-            enable_checkpointing=False,
-            enable_model_summary=False,
-            logger=False,
-        )
-        trainer.fit(module, datamodule=datamodule)
-        metrics = {
-            key: float(value)
-            for key, value in trainer.test(
-                module, datamodule=datamodule, verbose=False
-            )[0].items()
-        }
-        if output_dir:
-            trainer.save_checkpoint(output_dir / f"{args.model}.ckpt")
-            if not args.no_maps:
-                _export_maps(module, datamodule, area, output_dir)
+        tracker.log_json(config.to_dict(), "config.json")
 
-    rendered = json.dumps(metrics, indent=2, sort_keys=True)
-    if output_dir:
-        (output_dir / "metrics.json").write_text(rendered, encoding="utf-8")
+        if args.model == _RANDOM_FOREST:
+            metrics = _run_random_forest(area.graph, datamodule)
+            tracker.log_metrics(metrics)
+        else:
+            metrics = _train_one_model(
+                args, config, area, datamodule, output_dir, tracker
+            )
+
+        rendered = json.dumps(metrics, indent=2, sort_keys=True)
+        if output_dir:
+            metrics_path = output_dir / "metrics.json"
+            metrics_path.write_text(rendered, encoding="utf-8")
+            tracker.log_artifact(metrics_path)
+        else:
+            tracker.log_json(metrics, "metrics.json")
     print(rendered)
     return metrics
 
 
+def _train_one_model(
+    args: argparse.Namespace,
+    config: ExperimentConfig,
+    area: Any,
+    datamodule: SpatioTemporalGraphDataModule,
+    output_dir: Path | None,
+    tracker: RunTracker,
+) -> dict[str, float]:
+    """Fit, test, and write out the checkpoint and the maps of one model."""
+    module = _build_module(args.model, config, datamodule.n_features)
+    trainer = _build_trainer(config, tracker)
+    print(_describe_runtime(trainer, config))
+    trainer.fit(module, datamodule=datamodule)
+    metrics = {
+        key: float(value)
+        for key, value in trainer.test(module, datamodule=datamodule, verbose=False)[
+            0
+        ].items()
+    }
+    if output_dir is None:
+        return metrics
+
+    checkpoint = output_dir / f"{args.model}.ckpt"
+    trainer.save_checkpoint(checkpoint)
+    if config.tracking.log_checkpoints:
+        tracker.log_artifact(checkpoint, artifact_path="checkpoints")
+    if not args.no_maps:
+        written = _export_maps(trainer, module, datamodule, area, output_dir)
+        if config.tracking.log_maps:
+            tracker.log_artifacts(written, artifact_path="maps")
+    return metrics
+
+
 def _export_maps(
+    trainer: pl.Trainer,
     module: SoilSealingModule,
     datamodule: SpatioTemporalGraphDataModule,
     area: Any,
     output_dir: Path,
-) -> None:
+) -> list[Path]:
     """Write the sub-annual products as GeoTIFFs on the study grid.
 
     Predictions are exported for **every** node, test split included: the split
     is there to make the reported metrics honest, not to blank out two thirds of
     the map an operator would use.
+
+    ``Trainer.predict`` is what produces them, so the forward pass runs on the
+    same device and at the same precision as the fit did.
+
+    Returns:
+        the files written, for the caller to attach to the MLflow run.
     """
     if area.grid is None:
         print("no georeferencing in the study area, skipping the GeoTIFF export")
-        return
+        return []
     from gnn_sar.data.raster import write_raster
 
-    maps = module.predict_maps(datamodule.batch("test"))
+    maps = trainer.predict(module, datamodule=datamodule)[0]
     geometries = area.geometries
-    written = []
+    written: list[Path] = []
     for name, values, dtype, nodata in (
         ("sealed_probability", maps["sealed_probability"], "float32", float("nan")),
         # -1 is the model's own "never detected", so it doubles as nodata.
@@ -600,11 +807,11 @@ def _export_maps(
         f"maps written: {', '.join(path.name for path in written)}\n"
         f"band order of the multi-composite maps: {composites}"
     )
+    return written
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    torch.set_float32_matmul_precision("high")
 
     if args.command == "sites":
         run_sites(args)

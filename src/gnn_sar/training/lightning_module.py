@@ -10,6 +10,11 @@ validation points whose date is known), together with the detection delay.
 Quoting a sub-annual F1 computed against annual labels would be measuring the
 model against a target that does not exist, so the module simply does not
 produce one.
+
+Nothing here is device-specific: the loss, the metrics and the heads all follow
+the module, and :meth:`SoilSealingModule.predict_maps` moves the batch it is
+handed onto the module's own device. That is what lets the same code run on a
+CPU, a CUDA card or Apple's MPS with only ``accelerator`` changing.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from gnn_sar.data.targets import IGNORE_INDEX, state_to_onset
 from gnn_sar.losses.weak import WeakTemporalSupervisionLoss, aggregate_year_logit
 from gnn_sar.metrics.delay import detection_delay, onset_from_probability
 from gnn_sar.models.stgnn import STGNNOutput, SpatioTemporalGNN
+from gnn_sar.training.datamodule import move_batch_to_device
 
 __all__ = ["SoilSealingModule"]
 
@@ -180,25 +186,44 @@ class SoilSealingModule(pl.LightningModule):
             metric.update(probability, target.long())
             self.log(f"{split}/{level}_{name}", metric, batch_size=1, prog_bar=name == "f1")
 
+    def predict_step(
+        self, batch: dict[str, Any], batch_idx: int, dataloader_idx: int = 0
+    ) -> dict[str, np.ndarray]:
+        """The sub-annual products, so ``Trainer.predict`` handles the device."""
+        del batch_idx, dataloader_idx
+        return self.predict_maps(batch)
+
     @torch.no_grad()
     def predict_maps(
         self, batch: dict[str, Any], threshold: float | None = None
     ) -> dict[str, np.ndarray]:
-        """Sub-annual outputs for a whole study area.
+        """Sub-annual outputs for a whole study area, as NumPy arrays.
+
+        The batch is moved onto the module's device first, so a batch straight
+        from :meth:`SpatioTemporalGraphDataModule.batch` — which builds its
+        tensors on the CPU — can be fed to a module that ``Trainer.fit`` has
+        already moved to a GPU.
 
         Returns:
             ``sealed_probability`` ``(T, N)``, ``onset`` ``(N,)`` and, when the
             predictive head is enabled, ``early_warning`` ``(T, N)``.
         """
+        was_training = self.training
         self.eval()
         threshold = self.training_config.decision_threshold if threshold is None else threshold
-        output = self(batch["features"], batch["spatial_edge_index"])
+        batch = move_batch_to_device(batch, self.device)
+        try:
+            output = self(batch["features"], batch["spatial_edge_index"])
+        finally:
+            self.train(was_training)
         maps = {
-            "sealed_probability": output.sealed_probability.cpu().numpy(),
+            "sealed_probability": output.sealed_probability.float().cpu().numpy(),
             "onset": onset_from_probability(output.sealed_probability, threshold),
         }
         if output.horizon_logits is not None:
-            maps["early_warning"] = torch.sigmoid(output.horizon_logits).cpu().numpy()
+            maps["early_warning"] = (
+                torch.sigmoid(output.horizon_logits).float().cpu().numpy()
+            )
         return maps
 
 

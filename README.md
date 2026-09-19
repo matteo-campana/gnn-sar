@@ -42,6 +42,9 @@ first so the CUDA runtime is not pulled in:
 pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
 ```
 
+MLflow is a core dependency, not an extra: every run is recorded, and the one
+place a result lives is its run rather than a filename.
+
 ## Quickstart
 
 Train the model and its ablations on a synthetic land-take scenario and print
@@ -56,8 +59,8 @@ Or drive the pieces yourself:
 ```python
 from gnn_sar.data import make_synthetic_scenario
 from gnn_sar.models import SpatioTemporalGNN
-from gnn_sar.config import ModelConfig
-from gnn_sar.training import SpatioTemporalGraphDataModule, SoilSealingModule
+from gnn_sar.config import ModelConfig, TrackingConfig
+from gnn_sar.training import SpatioTemporalGraphDataModule, SoilSealingModule, tracked_run
 import pytorch_lightning as pl
 
 scenario = make_synthetic_scenario(height=80, width=80, n_time=24)
@@ -67,14 +70,64 @@ data.setup()
 module = SoilSealingModule(
     model=SpatioTemporalGNN(ModelConfig(in_channels=data.n_features))
 )
-pl.Trainer(max_epochs=50).fit(module, datamodule=data)
 
+with tracked_run(TrackingConfig(experiment_name="scratch"), run_name="stgnn") as run:
+    trainer = pl.Trainer(
+        max_epochs=50,
+        # "auto" takes a GPU when there is one; "bf16-mixed" roughly halves the
+        # memory the feature tensor needs on an Ampere or newer card.
+        accelerator="auto",
+        devices=1,
+        precision="bf16-mixed",
+        logger=run.trainer_logger,
+    )
+    trainer.fit(module, datamodule=data)
+
+# The batch is built on the CPU and the module may be on a GPU; predict_maps
+# moves it, so this line is the same on either.
 maps = module.predict_maps(data.batch("test"))
 maps["sealed_probability"]        # (T, N) monotone sub-annual sealing map
 maps["onset"]                     # (N,)   first composite flagged per node
 maps["early_warning"]             # (T, N) "seals within the next h composites"
 raster = scenario.geometries.rasterise(maps["sealed_probability"][-1])
 ```
+
+### GPU and tracking
+
+`train` and `demo` share the same runtime flags, and the defaults already do the
+right thing on a GPU machine — `--accelerator auto --devices 1` is the default,
+so there is nothing to add:
+
+```bash
+# an explicit GPU run in reduced precision, logged to a named experiment
+gnn-sar train viterbo/cache/viterbo.npz --output-dir results/ \
+    --accelerator gpu --precision bf16-mixed --experiment-name viterbo
+
+# then read the runs back
+mlflow ui            # http://127.0.0.1:5000, reads ./mlruns
+```
+
+| Flag | What it does |
+| --- | --- |
+| `--accelerator` | `auto` (default), `cpu`, `gpu`, `cuda`, `mps`, `tpu` |
+| `--devices` | how many, or `auto`. One study area is a single full-batch graph, so more than one device replicates it instead of splitting it |
+| `--precision` | `32-true` (default), `bf16-mixed`, `16-mixed`, … Lightning falls back to something a CPU supports, so a config stays portable |
+| `--tracking-uri` | where MLflow writes; defaults to `MLFLOW_TRACKING_URI`, then to a local `./mlruns` |
+| `--experiment-name`, `--run-name` | how the run is filed |
+| `--no-tracking` | record nothing at all |
+
+Every run carries the whole resolved `ExperimentConfig` as parameters, the
+Lightning metrics per epoch, and — for `train --output-dir` — the config, the
+`metrics.json`, the checkpoint and the sub-annual GeoTIFFs as artefacts. `demo`
+opens one run per compared model, tagged with its name, so the ablation of OS3 is
+a filter in the UI rather than a diff of two console logs.
+
+The default store is a local `./mlruns` directory, which `mlflow ui` reads with
+no arguments. MLflow 3 considers that backend deprecated and refuses it unless
+`MLFLOW_ALLOW_FILE_STORE` is set, so the project sets it for its own process when
+it is the one choosing the path; pass `--tracking-uri sqlite:///mlflow.db` (and
+`mlflow ui --backend-store-uri sqlite:///mlflow.db`) for the backend MLflow
+itself recommends.
 
 ## Working with real data
 
@@ -97,6 +150,8 @@ gnn-sar preprocess s2 --site viterbo --input data/raw/s2 --output viterbo/s2
 gnn-sar ingest docs/esempi/aree/viterbo.json
 
 # 4. train, and write the sub-annual products back out as GeoTIFFs
+#    (add --accelerator gpu --precision bf16-mixed on a GPU machine; the run,
+#     the checkpoint and the maps land in MLflow either way)
 gnn-sar train viterbo/cache/viterbo.npz --model stgnn --output-dir results/
 ```
 
@@ -174,7 +229,7 @@ composites of the same labelled year does not change the loss at all.
 | `gnn_sar.models.baselines` | The same model minus the graph, minus time, and a random forest |
 | `gnn_sar.losses.weak` | Multiple-instance annual loss, graph smoothness, single-onset |
 | `gnn_sar.metrics` | Detection delay, early-warning lead time, OA/F1/IoU/kappa |
-| `gnn_sar.training` | Lightning datamodule, module and the `gnn-sar search/ingest/train/demo` CLI |
+| `gnn_sar.training` | Lightning datamodule, module, MLflow tracking and the `gnn-sar search/ingest/train/demo` CLI |
 
 ## What the demo actually reports
 
